@@ -1,0 +1,171 @@
+// Reusable file-type icons rendered as draw.Surface from simple SVG paths, so a file manager
+// (or any application) can show real icons without shipping raster assets.
+module airpolo.toolkit.icons
+
+import std.draw as draw
+import std.svg as svg
+import std.text as text
+
+fn path_for(kind: str) -> string effects {alloc} {
+  if str.eq(kind, "folder") { return string.copy("M2 5h7l2 2h11v12H2z") }
+  if str.eq(kind, "image") { return string.copy("M3 3h18v18H3z M7 9a2 2 0 1 0 0 0.1 M5 17l4-4 3 3 4-5 4 5") }
+  if str.eq(kind, "video") { return string.copy("M3 5h18v14H3z M10 9l6 3-6 3z") }
+  if str.eq(kind, "audio") { return string.copy("M9 18V6l10-2v12z") }
+  if str.eq(kind, "archive") { return string.copy("M3 4h18v4H3z M5 8v12h14V8z") }
+  if str.eq(kind, "document") { return string.copy("M6 2h12v20H6z") }
+  if str.eq(kind, "link") { return string.copy("M10 14a4 4 0 0 1 0-6l2-2a4 4 0 0 1 6 6l-1 1") }
+  string.copy("M6 2h8l4 4v16H6z")
+}
+
+fn color_for(kind: str) -> draw.Color effects {} {
+  if str.eq(kind, "folder") { return draw.rgb(240, 190, 90) }
+  if str.eq(kind, "image") { return draw.rgb(120, 200, 120) }
+  if str.eq(kind, "video") { return draw.rgb(150, 130, 230) }
+  if str.eq(kind, "audio") { return draw.rgb(240, 150, 90) }
+  if str.eq(kind, "archive") { return draw.rgb(200, 160, 90) }
+  if str.eq(kind, "document") { return draw.rgb(220, 90, 90) }
+  if str.eq(kind, "link") { return draw.rgb(120, 190, 220) }
+  draw.rgb(170, 175, 185)
+}
+
+// Wrap the path in a minimal SVG document; std.svg renders documents, not bare path data.
+fn document_for(kind: str) -> string effects {alloc} {
+  var doc: string = string.copy("<svg viewBox='0 0 24 24'><path d='")
+  string.append(doc, str.view(path_for(kind)))
+  string.append(doc, "' fill='currentColor'/></svg>")
+  doc
+}
+
+pub fn surface_for(kind: str, size: u32) -> option<draw.Surface> effects {alloc} {
+  let document: string = document_for(kind)
+  match svg.render(str.view(document), size, size, color_for(kind)) {
+    ok(surface) => option.some(surface),
+    err(_) => option.none(),
+  }
+}
+
+// One rendered icon retained by kind and size so a list of many rows renders each
+// distinct file type once per frame instead of once per row.
+pub type IconEntry = struct { kind: string, size: u32, surface: draw.Surface }
+
+fn duplicate(source: ref<draw.Surface>) -> draw.Surface effects {alloc} {
+  let copy: bytes = draw.surface_rgba(source)
+  let data: view<byte> = bytes.view(copy)
+  var pixels: array<byte> = array.new()
+  var at: u64 = 0
+  loop {
+    if at >= view.len(data) { break }
+    array.push(pixels, view.get(data, at))
+    at = at + 1
+  }
+  draw.Surface {
+    width: draw.surface_width(source), height: draw.surface_height(source), pixels: pixels
+  }
+}
+
+pub fn cached(cache: ref<array<IconEntry>>, kind: str, size: u32) -> draw.Surface effects {alloc} {
+  var i: u64 = 0
+  loop {
+    if i >= array.len(cache) { break }
+    let entry: ref<IconEntry> = array.borrow(cache, i)
+    if entry.size == size and str.eq(str.view(entry.kind), kind) { return duplicate(entry.surface) }
+    i = i + 1
+  }
+  var picture: draw.Surface = draw.empty_surface()
+  match surface_for(kind, size) {
+    some(value) => { picture = value },
+    none => {},
+  }
+  array.push(cache, IconEntry {kind: string.copy(kind), size: size, surface: picture})
+  duplicate(struct.borrow(array.borrow(cache, array.len(cache) - 1), field=surface))
+}
+
+// ── Toolbar/action icons ─────────────────────────────────────────────────────
+// Polo's toolbar uses the freedesktop symbolic icon names below; each maps to a simple
+// filled 24x24 path so the same vocabulary renders without a system icon theme.
+
+fn action_path(name: str) -> string effects {alloc} {
+  if str.eq(name, "back") { return string.copy("M16 4l-10 8 10 8z") }
+  if str.eq(name, "forward") { return string.copy("M8 4l10 8-10 8z") }
+  if str.eq(name, "up") { return string.copy("M12 4l8 10h-5v6h-6v-6H4z") }
+  if str.eq(name, "home") { return string.copy("M12 3l9 8h-3v9h-5v-6h-2v6H6v-9H3z") }
+  if str.eq(name, "reload") { return string.copy("M12 4a8 8 0 1 0 7.4 5h-3.2A5 5 0 1 1 12 7z M13 2h7v7l-7-7z") }
+  if str.eq(name, "view-grid") { return string.copy("M3 3h7v7H3z M14 3h7v7h-7z M3 14h7v7H3z M14 14h7v7h-7z") }
+  if str.eq(name, "view-list") { return string.copy("M4 5h16v2H4z M4 11h16v2H4z M4 17h16v2H4z") }
+  if str.eq(name, "bookmarks") { return string.copy("M6 3h12v18l-6-5-6 5z") }
+  if str.eq(name, "devices") { return string.copy("M3 5h18v9H3z M5 16h14v4H5z M6 8a1 1 0 1 0 0 2 1 1 0 0 0 0-2z") }
+  if str.eq(name, "terminal") { return string.copy("M3 4h18v16H3z M6 8l5 4-5 4z M13 14h5v2h-5z") }
+  if str.eq(name, "properties") { return string.copy("M4 5h16v2H4z M4 11h16v2H4z M4 17h16v2H4z") }
+  if str.eq(name, "settings") { return string.copy("M11 2h2v4h-2z M11 18h2v4h-2z M2 11h4v2H2z M18 11h4v2h-4z M4 4l3 3-1 1-3-3z M20 20l-3-3 1-1 3 3z M20 4l-3 3-1-1 3-3z M4 20l3-3 1 1-3 3z M12 8a4 4 0 1 0 0 8 4 4 0 0 0 0-8z") }
+  if str.eq(name, "donate") { return string.copy("M12 21s-8-5-8-11a4 4 0 0 1 8-2 4 4 0 0 1 8 2c0 6-8 11-8 11z") }
+  if str.eq(name, "about") { return string.copy("M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18z M11 7h2v2h-2z M11 11h2v6h-2z") }
+  if str.eq(name, "cut") { return string.copy("M6 4l6 8-2 3-4-6z M18 4l-6 8 2 3 4-6z M8 18a2 2 0 1 0 0 2 2 2 0 0 0 0-2z M16 18a2 2 0 1 0 0 2 2 2 0 0 0 0-2z") }
+  if str.eq(name, "copy") { return string.copy("M8 8h12v12H8z M4 4h12v2H6v10H4z") }
+  if str.eq(name, "paste") { return string.copy("M8 3h8v3H8z M6 5h12v16H6z") }
+  if str.eq(name, "trash") { return string.copy("M5 7h14l-1 14H6z M9 4h6v2H9z") }
+  if str.eq(name, "delete") { return string.copy("M6 7h12l-1 14H7z M9 4h6v2H9z M10 10v8h1v-8z M13 10v8h1v-8z") }
+  if str.eq(name, "rename") { return string.copy("M4 17l10-10 3 3-10 10H4z M14 5l3 3 1-1-3-3z") }
+  if str.eq(name, "new-file") { return string.copy("M6 3h8l4 4v14H6z M14 3v4h4z M11 12h2v6h-2z M9 14h6v2H9z") }
+  if str.eq(name, "new-folder") { return string.copy("M3 6h7l2 2h9v11H3z M11 11h2v6h-2z M9 13h6v2H9z") }
+  if str.eq(name, "folder-move") { return string.copy("M3 6h7l2 2h9v11H3z M8 13h6v-2l4 3-4 3v-2H8z") }
+  if str.eq(name, "folder-copy") { return string.copy("M3 6h7l2 2h9v11H3z M9 11h6v6H9z") }
+  if str.eq(name, "swap") { return string.copy("M7 4l-4 4 4 4V9h8V7H7z M17 12l4 4-4 4v-3H9v-2h8z") }
+  if str.eq(name, "search") { return string.copy("M10 3a7 7 0 1 0 0 14 7 7 0 0 0 0-14z M15 15l6 6-2 2-6-6z") }
+  if str.eq(name, "checksum") { return string.copy("M12 3l8 4v6c0 5-4 8-8 9-4-1-8-4-8-9V7z") }
+  if str.eq(name, "compress") { return string.copy("M3 4h18v4H3z M5 8v12h14V8z M11 10h2v8h-2z") }
+  if str.eq(name, "extract") { return string.copy("M6 3h8l4 4v14H6z M11 8h2v7h-2z M9 13l3 3 3-3z") }
+  if str.eq(name, "permissions") { return string.copy("M8 10V8a4 4 0 0 1 8 0v2h2v11H6V10z M10 8a2 2 0 0 1 4 0v2h-4z") }
+  if str.eq(name, "actions") { return string.copy("M13 2L4 14h6l-1 8 9-12h-6z") }
+  if str.eq(name, "dual") { return string.copy("M3 4h8v16H3z M13 4h8v16h-8z") }
+  if str.eq(name, "focus") { return string.copy("M4 4h16v16H4z M9 9h6v6H9z") }
+  if str.eq(name, "open") { return string.copy("M3 6h7l2 2h9v11H3z M8 13l4 4 4-4h-3v-4h-2v4z") }
+  if str.eq(name, "hidden") { return string.copy("M2 12s4-6 10-6 10 6 10 6-4 6-10 6-10-6-10-6z M12 9a3 3 0 1 0 0 6 3 3 0 0 0 0-6z") }
+  if str.eq(name, "eject") { return string.copy("M12 4l6 7H6z M6 15h12v2H6z") }
+  if str.eq(name, "media") { return string.copy("M8 5l12-2v14H8z M8 19a3 2 0 1 0 0 .1 M4 8h3v9H4z") }
+  if str.eq(name, "admin") { return string.copy("M12 2l8 3v6c0 5-3 9-8 11-5-2-8-6-8-11V5z") }
+  if str.eq(name, "tools") { return string.copy("M14 3a5 5 0 0 0-4 8L4 17l3 3 6-6a5 5 0 0 0 1-11z") }
+  string.copy("M6 2h8l4 4v16H6z")
+}
+
+fn action_color(name: str) -> draw.Color effects {} {
+  if str.eq(name, "trash") or str.eq(name, "delete") { return draw.rgb(190, 80, 80) }
+  if str.eq(name, "donate") { return draw.rgb(220, 90, 130) }
+  if str.eq(name, "checksum") { return draw.rgb(90, 160, 200) }
+  if str.eq(name, "actions") { return draw.rgb(230, 170, 60) }
+  if str.eq(name, "permissions") { return draw.rgb(120, 150, 200) }
+  if str.eq(name, "new-folder") { return draw.rgb(230, 180, 80) }
+  if str.eq(name, "compress") { return draw.rgb(200, 160, 90) }
+  draw.rgb(70, 90, 120)
+}
+
+fn action_document(name: str) -> string effects {alloc} {
+  var doc: string = string.copy("<svg viewBox='0 0 24 24'><path d='")
+  string.append(doc, str.view(action_path(name)))
+  string.append(doc, "' fill='currentColor'/></svg>")
+  doc
+}
+
+pub fn action_surface(name: str, size: u32) -> option<draw.Surface> effects {alloc} {
+  match svg.render(str.view(action_document(name)), size, size, action_color(name)) {
+    ok(surface) => option.some(surface),
+    err(_) => option.none(),
+  }
+}
+
+// Cached variant for toolbars: one render per action name and size per frame.
+pub fn action_cached(cache: ref<array<IconEntry>>, name: str, size: u32) -> draw.Surface effects {alloc} {
+  var i: u64 = 0
+  loop {
+    if i >= array.len(cache) { break }
+    let entry: ref<IconEntry> = array.borrow(cache, i)
+    if entry.size == size and str.eq(str.view(entry.kind), name) { return duplicate(entry.surface) }
+    i = i + 1
+  }
+  var picture: draw.Surface = draw.empty_surface()
+  match action_surface(name, size) {
+    some(value) => { picture = value },
+    none => {},
+  }
+  array.push(cache, IconEntry {kind: string.copy(name), size: size, surface: picture})
+  duplicate(struct.borrow(array.borrow(cache, array.len(cache) - 1), field=surface))
+}

@@ -1,0 +1,205 @@
+// Application theme helpers built on AIR's shared std.widgets Theme contract.
+module airpolo.toolkit.theme
+
+import std.draw as draw
+import std.widgets as widgets
+
+pub fn pack(red: u64, green: u64, blue: u64) -> u64 effects {} {
+  (red % 256) * 65536 + (green % 256) * 256 + (blue % 256)
+}
+
+pub fn red(value: u64) -> u64 effects {} { (value / 65536) % 256 }
+pub fn green(value: u64) -> u64 effects {} { (value / 256) % 256 }
+pub fn blue(value: u64) -> u64 effects {} { value % 256 }
+
+pub fn with_channel(value: u64, channel: u64, component: u64) -> u64 effects {} {
+  let part: u64 = if component > 255 { 255 } else { component }
+  if channel == 0 { return pack(part, green(value), blue(value)) }
+  if channel == 1 { return pack(red(value), part, blue(value)) }
+  pack(red(value), green(value), part)
+}
+
+pub fn default_background() -> u64 effects {} { pack(246, 247, 249) }
+pub fn default_accent() -> u64 effects {} { pack(37, 99, 235) }
+
+pub fn background_choice(index: u64) -> u64 effects {} {
+  if index == 1 { return pack(23, 25, 30) }
+  if index == 2 { return pack(30, 41, 59) }
+  if index == 3 { return pack(8, 35, 48) }
+  if index == 4 { return pack(244, 240, 232) }
+  default_background()
+}
+
+pub fn preset_background(index: u64) -> u64 effects {} {
+  if index == 3 { return background_choice(4) }
+  background_choice(index)
+}
+
+pub fn preset_accent(index: u64) -> u64 effects {} {
+  if index == 1 { return pack(59, 130, 246) }
+  if index == 2 { return pack(20, 184, 166) }
+  if index == 3 { return pack(180, 83, 9) }
+  default_accent()
+}
+
+pub fn accent_choice(index: u64) -> u64 effects {} {
+  if index == 1 { return pack(13, 148, 136) }
+  if index == 2 { return pack(22, 163, 74) }
+  if index == 3 { return pack(217, 119, 6) }
+  if index == 4 { return pack(225, 29, 72) }
+  if index == 5 { return pack(124, 58, 237) }
+  default_accent()
+}
+
+// Source-faithful application themes ported from
+// /home/alex/serenity-inference/ui/theme.py. AIR's standard Theme has ten
+// semantic colors rather than DearPyGui's larger table, so each value below
+// maps the corresponding source token: window, child, text, disabled text,
+// border, primary accent, selected text background, and frame background.
+pub fn source_theme_count() -> u64 effects {} { 7 }
+
+pub fn source_theme_background(index: u64) -> u64 effects {} {
+  if index == 0 { return pack(26, 26, 46) }    // Serenity
+  if index == 1 { return pack(20, 22, 26) }    // Moonlight
+  if index == 2 { return pack(0, 0, 0) }       // Monochrome
+  if index == 3 { return pack(46, 51, 64) }    // Nord
+  if index == 4 { return pack(33, 36, 43) }    // Cinder
+  if index == 5 { return pack(56, 56, 56) }    // Blender
+  if index == 6 { return pack(0, 10, 31) }     // Cyberpunk
+  default_background()
+}
+
+pub fn source_theme_accent(index: u64) -> u64 effects {} {
+  if index == 0 { return pack(67, 97, 238) }
+  if index == 1 { return pack(248, 255, 127) }
+  if index == 2 { return pack(0, 255, 255) }
+  if index == 3 { return pack(94, 130, 171) }
+  if index == 4 { return pack(235, 46, 74) }
+  if index == 5 { return pack(71, 115, 178) }
+  if index == 6 { return pack(0, 250, 255) }
+  default_accent()
+}
+
+pub fn source_theme(index: u64) -> widgets.Theme effects {} {
+  if index == 0 {
+    return widgets.Theme {
+      background: draw.color(26, 26, 46, 255), surface: draw.color(22, 33, 62, 255),
+      ink: draw.color(232, 232, 232, 255), faint: draw.color(102, 102, 102, 255),
+      line: draw.color(42, 42, 74, 255), accent: draw.color(67, 97, 238, 255),
+      accent_ink: draw.color(232, 232, 232, 255), danger: draw.color(235, 46, 74, 255),
+      selection: draw.color(67, 97, 238, 100), shade: draw.color(22, 33, 62, 255)
+    }
+  }
+  if index == 1 {
+    return widgets.Theme {
+      background: draw.color(20, 22, 26, 255), surface: draw.color(24, 26, 30, 255),
+      ink: draw.color(255, 255, 255, 255), faint: draw.color(70, 81, 115, 255),
+      line: draw.color(40, 43, 49, 255), accent: draw.color(248, 255, 127, 255),
+      accent_ink: draw.color(20, 22, 26, 255), danger: draw.color(235, 46, 74, 255),
+      selection: draw.color(180, 180, 200, 100), shade: draw.color(29, 32, 39, 255)
+    }
+  }
+  if index == 2 {
+    return widgets.Theme {
+      // DearPyGui composites the transparent child/frame tokens over the black
+      // window. Precompose those structural colors here: AIR dialogs must be
+      // opaque or the file table underneath remains visible and every repaint
+      // pays for a full-pane alpha blend.
+      background: draw.color(0, 0, 0, 255), surface: draw.color(0, 0, 0, 255),
+      ink: draw.color(0, 255, 255, 255), faint: draw.color(0, 102, 105, 255),
+      line: draw.color(0, 255, 255, 166), accent: draw.color(0, 255, 255, 255),
+      accent_ink: draw.color(0, 0, 0, 255), danger: draw.color(235, 46, 74, 255),
+      selection: draw.color(0, 255, 255, 56), shade: draw.color(20, 37, 37, 255)
+    }
+  }
+  if index == 3 {
+    return widgets.Theme {
+      background: draw.color(46, 51, 64, 255), surface: draw.color(41, 43, 51, 255),
+      ink: draw.color(217, 222, 232, 224), faint: draw.color(125, 128, 135, 255),
+      line: draw.color(36, 41, 48, 255), accent: draw.color(94, 130, 171, 255),
+      accent_ink: draw.color(217, 222, 232, 224), danger: draw.color(235, 46, 74, 255),
+      selection: draw.color(94, 130, 171, 255), shade: draw.color(59, 66, 82, 255)
+    }
+  }
+  if index == 4 {
+    return widgets.Theme {
+      background: draw.color(33, 36, 43, 255), surface: draw.color(33, 36, 43, 255),
+      ink: draw.color(219, 237, 227, 199), faint: draw.color(219, 237, 227, 71),
+      line: draw.color(79, 79, 255, 0), accent: draw.color(235, 46, 74, 255),
+      accent_ink: draw.color(219, 237, 227, 255), danger: draw.color(235, 46, 74, 255),
+      selection: draw.color(235, 46, 74, 110), shade: draw.color(51, 56, 69, 255)
+    }
+  }
+  if index == 5 {
+    return widgets.Theme {
+      background: draw.color(56, 56, 56, 255), surface: draw.color(48, 48, 48, 255),
+      ink: draw.color(214, 214, 214, 255), faint: draw.color(128, 128, 128, 255),
+      line: draw.color(43, 43, 43, 255), accent: draw.color(71, 115, 178, 255),
+      accent_ink: draw.color(214, 214, 214, 255), danger: draw.color(235, 46, 74, 255),
+      selection: draw.color(71, 115, 178, 255), shade: draw.color(84, 84, 84, 255)
+    }
+  }
+  if index == 6 {
+    return widgets.Theme {
+      background: draw.color(0, 10, 31, 255), surface: draw.color(8, 10, 56, 255),
+      ink: draw.color(0, 209, 255, 255), faint: draw.color(0, 92, 161, 255),
+      line: draw.color(156, 0, 255, 255), accent: draw.color(0, 250, 255, 133),
+      accent_ink: draw.color(0, 10, 31, 255), danger: draw.color(235, 46, 74, 255),
+      selection: draw.color(0, 209, 255, 102), shade: draw.color(0, 191, 255, 51)
+    }
+  }
+  source_theme(0)
+}
+
+fn color(value: u64) -> draw.Color effects {} {
+  draw.rgb(cast.sat(red(value)), cast.sat(green(value)), cast.sat(blue(value)))
+}
+
+fn lighten(value: u64, amount: u64) -> draw.Color effects {} {
+  let limit: u64 = 255
+  draw.rgb(cast.sat(if red(value) + amount > limit { limit } else { red(value) + amount }),
+           cast.sat(if green(value) + amount > limit { limit } else { green(value) + amount }),
+           cast.sat(if blue(value) + amount > limit { limit } else { blue(value) + amount }))
+}
+
+fn darken(value: u64, amount: u64) -> draw.Color effects {} {
+  let zero: u64 = 0
+  draw.rgb(cast.sat(if red(value) < amount { zero } else { red(value) - amount }),
+           cast.sat(if green(value) < amount { zero } else { green(value) - amount }),
+           cast.sat(if blue(value) < amount { zero } else { blue(value) - amount }))
+}
+
+pub fn is_dark(value: u64) -> bool effects {} {
+  red(value) * 299 + green(value) * 587 + blue(value) * 114 < 128000
+}
+
+// Derive every standard control color from the two user-facing choices. Since
+// std.widgets paints all controls from Theme, this changes the whole application.
+pub fn palette(background: u64, accent: u64) -> widgets.Theme effects {} {
+  var source: u64 = 0
+  loop {
+    if source >= source_theme_count() { break }
+    if background == source_theme_background(source) and accent == source_theme_accent(source) {
+      return source_theme(source)
+    }
+    source = source + 1
+  }
+  if is_dark(background) {
+    return widgets.Theme {
+      background: color(background), surface: lighten(background, 15),
+      ink: draw.rgb(244, 246, 250), faint: draw.rgb(166, 174, 188),
+      line: lighten(background, 42), accent: color(accent),
+      accent_ink: if is_dark(accent) { draw.rgb(255, 255, 255) } else { draw.rgb(16, 20, 26) },
+      danger: draw.rgb(239, 93, 105), selection: lighten(background, 35),
+      shade: lighten(background, 9)
+    }
+  }
+  widgets.Theme {
+    background: color(background), surface: lighten(background, 12),
+    ink: draw.rgb(24, 26, 31), faint: draw.rgb(105, 112, 124),
+    line: darken(background, 38), accent: color(accent),
+    accent_ink: if is_dark(accent) { draw.rgb(255, 255, 255) } else { draw.rgb(16, 20, 26) },
+    danger: draw.rgb(190, 42, 42), selection: darken(background, 18),
+    shade: darken(background, 9)
+  }
+}

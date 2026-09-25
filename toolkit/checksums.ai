@@ -1,0 +1,49 @@
+// Reusable checksum helpers. SHA-256 is native (files.sha256); the other digests use the
+// coreutils tools so the toolkit stays small, and every call returns a plain string error.
+module airpolo.toolkit.checksums
+
+import std.files as files
+import std.process as proc
+import std.path as path
+import std.text as text
+
+fn run_sum(tool: str, target: str, log: str) -> result<string, string> effects {alloc, process, fs.read, fs.meta} {
+  var argv: array<string> = array.new()
+  array.push(argv, string.copy(tool))
+  array.push(argv, string.copy(target))
+  match proc.run(argv, "/", log, false) {
+    ok(status) => {
+      if not proc.success(status) {
+        let tail: string = proc.tail(log, 512)
+        if str.len(str.view(tail)) != 0 { return result.err(tail) }
+        return result.err(string.copy("checksum tool failed"))
+      }
+      let body: string = match files.read_text(log) { ok(value) => value, err(_) => string.new() }
+      let line: str = text.trim(str.view(body))
+      match str.find(line, " ") {
+        some(at) => result.ok(string.copy(str.slice(line, 0, at))),
+        none => result.ok(string.copy(line)),
+      }
+    },
+    err(error) => result.err(string.copy(fs.error.message(error))),
+  }
+}
+
+pub fn sha256_of(target: str) -> result<string, string> effects {alloc, fs.read, fs.meta} {
+  match files.sha256(target) {
+    ok(value) => result.ok(value),
+    err(error) => result.err(string.copy(fs.error.message(error))),
+  }
+}
+
+pub fn md5_of(target: str, log: str) -> result<string, string> effects {alloc, process, fs.read, fs.meta} {
+  run_sum("md5sum", target, log)
+}
+
+pub fn sha1_of(target: str, log: str) -> result<string, string> effects {alloc, process, fs.read, fs.meta} {
+  run_sum("sha1sum", target, log)
+}
+
+pub fn sha512_of(target: str, log: str) -> result<string, string> effects {alloc, process, fs.read, fs.meta} {
+  run_sum("sha512sum", target, log)
+}

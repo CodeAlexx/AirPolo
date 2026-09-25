@@ -1,0 +1,11 @@
+/.air/
+/build/
+/airpolo
+
+*.py
+*.py[cod]
+__pycache__/
+
+*.md
+!README.md
+.DS_Store

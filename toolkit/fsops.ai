@@ -1,0 +1,433 @@
+// Reusable filesystem model and operations for file-manager applications.
+//
+// Provides a directory listing with metadata, deterministic sorting, path helpers and the
+// ordinary operations (create, rename, copy, move, delete, trash). No UI or application
+// state; intended to be lifted into an AIR toolkit and reused.
+module airpolo.toolkit.fsops
+
+import std.files as files
+import std.path as path
+import std.text as text
+import "format.ai" as fmt
+
+pub type Entry = struct {
+  name: string,
+  path: string,
+  is_dir: bool,
+  is_link: bool,
+  size: u64,
+  mtime_ns: i64,
+  kind: string
+}
+
+// Field accessors so callers holding an owned Entry can read its owned strings without
+// moving them out (the verifier requires a borrow for an owned field).
+pub fn name_of(e: ref<Entry>) -> string effects {alloc} { string.copy(e.name) }
+pub fn path_of(e: ref<Entry>) -> string effects {alloc} { string.copy(e.path) }
+pub fn kind_label(e: ref<Entry>) -> string effects {alloc} { string.copy(e.kind) }
+pub fn size_of(e: ref<Entry>) -> u64 effects {} { e.size }
+pub fn is_dir_of(e: ref<Entry>) -> bool effects {} { e.is_dir }
+pub fn is_link_of(e: ref<Entry>) -> bool effects {} { e.is_link }
+pub fn mtime_of(e: ref<Entry>) -> i64 effects {} { e.mtime_ns }
+
+pub fn sort_name() -> u64 effects {} { 0 }
+pub fn sort_size() -> u64 effects {} { 1 }
+pub fn sort_mtime() -> u64 effects {} { 2 }
+
+fn copy_entry(value: ref<Entry>) -> Entry effects {alloc} {
+  Entry {
+    name: string.copy(value.name), path: string.copy(value.path),
+    is_dir: value.is_dir, is_link: value.is_link, size: value.size,
+    mtime_ns: value.mtime_ns, kind: string.copy(value.kind)
+  }
+}
+
+fn less_idx(entries: ref<array<Entry>>, ia: u64, ib: u64, mode: u64) -> bool effects {alloc} {
+  let a_dir: bool = array.borrow(entries, ia).is_dir
+  let b_dir: bool = array.borrow(entries, ib).is_dir
+  if a_dir != b_dir { return a_dir }
+  if mode == 1 {
+    let a_size: u64 = array.borrow(entries, ia).size
+    let b_size: u64 = array.borrow(entries, ib).size
+    if a_size != b_size { return a_size < b_size }
+  }
+  if mode == 2 {
+    let a_time: i64 = array.borrow(entries, ia).mtime_ns
+    let b_time: i64 = array.borrow(entries, ib).mtime_ns
+    if a_time != b_time { return a_time > b_time }
+  }
+  let a_name: string = string.copy(array.borrow(entries, ia).name)
+  let b_name: string = string.copy(array.borrow(entries, ib).name)
+  str.cmp(str.view(a_name), str.view(b_name)) < 0
+}
+
+pub fn sort_entries(entries: ref<array<Entry>>, mode: u64) -> unit effects {alloc} {
+  let n: u64 = array.len(entries)
+  var order: array<u64> = array.new()
+  var i: u64 = 0
+  loop {
+    if i >= n { break }
+    array.push(order, i)
+    i = i + 1
+  }
+  i = 1
+  loop {
+    if i >= n { break }
+    var j: u64 = i
+    loop {
+      if j == 0 { break }
+      if less_idx(entries, array.get(order, j - 1), array.get(order, j), mode) { break }
+      let current: u64 = array.get(order, j)
+      let previous: u64 = array.get(order, j - 1)
+      array.set(order, j - 1, current)
+      array.set(order, j, previous)
+      j = j - 1
+    }
+    i = i + 1
+  }
+  var sorted: array<Entry> = array.new()
+  i = 0
+  loop {
+    if i >= n { break }
+    array.push(sorted, copy_entry(array.borrow(entries, array.get(order, i))))
+    i = i + 1
+  }
+  let _old: array<Entry> = ref.swap(entries, sorted)
+  ()
+}
+
+pub fn list_entries(dir: str, show_hidden: bool, mode: u64) -> array<Entry> effects {alloc, fs.meta} {
+  var out: array<Entry> = array.new()
+  match files.list_dir(dir) {
+    ok(found) => {
+      var names: array<string> = found
+      var i: u64 = 0
+      loop {
+        if i >= array.len(names) { break }
+        let name: str = str.view(array.borrow(names, i))
+        if str.eq(name, ".") or str.eq(name, "..") { i = i + 1
+          continue }
+        if not show_hidden and str.starts_with(name, ".") { i = i + 1
+          continue }
+        let full: string = path.join(dir, name)
+        match files.symlink_metadata(str.view(full)) {
+          ok(meta) => {
+            array.push(out, Entry {
+              name: string.copy(name), path: full, is_dir: meta.is_dir,
+              is_link: meta.is_symlink, size: meta.size, mtime_ns: meta.mtime_ns,
+              kind: fmt.kind_of(name, meta.is_dir, meta.is_symlink)
+            })
+          },
+          err(_) => {},
+        }
+        i = i + 1
+      }
+    },
+    err(_) => {},
+  }
+  sort_entries(out, mode)
+  out
+}
+
+// A name that does not collide with an existing entry in `dir`.
+pub fn unique_path(dir: str, name: str) -> string effects {alloc, fs.meta} {
+  var candidate: string = path.join(dir, name)
+  match files.exists(str.view(candidate)) {
+    ok(present) => {
+      if not present { return candidate }
+    },
+    err(_) => { return candidate },
+  }
+  var stem: string = string.copy(str.view(path.stem(name)))
+  let ext: string = string.copy(str.view(path.extension(name)))
+  var n: u64 = 1
+  loop {
+    var next: string = string.copy(dir)
+    string.append(next, "/")
+    string.append(next, str.view(stem))
+    string.append(next, " (")
+    string.append(next, str.view(string.from_int(n)))
+    string.append(next, ")")
+    if str.len(str.view(ext)) != 0 {
+      string.append(next, ".")
+      string.append(next, str.view(ext))
+    }
+    match files.exists(str.view(next)) {
+      ok(present) => {
+        if not present { return next }
+      },
+      err(_) => { return next },
+    }
+    n = n + 1
+    if n > 9999 { return candidate }
+  }
+  candidate
+}
+
+pub fn make_directory(parent: str, name: str) -> result<string, string> effects {alloc, fs.meta, fs.write} {
+  let target: string = unique_path(parent, name)
+  match files.mkdirs(str.view(target)) {
+    ok(_) => result.ok(target),
+    err(error) => result.err(string.copy(fs.error.message(error))),
+  }
+}
+
+pub fn rename_entry(from: str, to: str) -> result<unit, string> effects {alloc, fs.write, fs.meta} {
+  match files.rename(from, to) {
+    ok(_) => result.ok(()),
+    err(error) => result.err(string.copy(fs.error.message(error))),
+  }
+}
+
+// Recursively remove a path. Directories are emptied depth-first; symlinks are unlinked.
+pub fn remove_tree(target: str) -> result<unit, string> effects {alloc, fs.meta, fs.read, fs.write} {
+  match files.symlink_metadata(target) {
+    ok(meta) => {
+      if meta.is_dir {
+        match files.list_dir(target) {
+          ok(found) => {
+            var names: array<string> = found
+            var i: u64 = 0
+            loop {
+              if i >= array.len(names) { break }
+              let name: str = str.view(array.borrow(names, i))
+              if not (str.eq(name, ".") or str.eq(name, "..")) {
+                let child: string = path.join(target, name)
+                match remove_tree(str.view(child)) {
+                  ok(_) => {},
+                  err(reason) => { return result.err(reason) },
+                }
+              }
+              i = i + 1
+            }
+          },
+          err(error) => { return result.err(string.copy(fs.error.message(error))) },
+        }
+      }
+    },
+    err(_) => {},
+  }
+  match files.remove(target) {
+    ok(_) => result.ok(()),
+    err(error) => result.err(string.copy(fs.error.message(error))),
+  }
+}
+
+// Recursively copy a file or directory into `destination`.
+pub fn copy_tree(source: str, destination: str) -> result<unit, string> effects {alloc, fs.meta, fs.read, fs.write} {
+  match files.symlink_metadata(source) {
+    ok(meta) => {
+      if meta.is_dir {
+        match files.mkdirs(destination) {
+          ok(_) => {},
+          err(error) => { return result.err(string.copy(fs.error.message(error))) },
+        }
+        match files.list_dir(source) {
+          ok(found) => {
+            var names: array<string> = found
+            var i: u64 = 0
+            loop {
+              if i >= array.len(names) { break }
+              let name: str = str.view(array.borrow(names, i))
+              if not (str.eq(name, ".") or str.eq(name, "..")) {
+                let from: string = path.join(source, name)
+                let to: string = path.join(destination, name)
+                match copy_tree(str.view(from), str.view(to)) {
+                  ok(_) => {},
+                  err(reason) => { return result.err(reason) },
+                }
+              }
+              i = i + 1
+            }
+          },
+          err(error) => { return result.err(string.copy(fs.error.message(error))) },
+        }
+        result.ok(())
+      } else {
+        match files.copy_new(source, destination) {
+          ok(_) => result.ok(()),
+          err(error) => result.err(string.copy(fs.error.message(error))),
+        }
+      }
+    },
+    err(error) => result.err(string.copy(fs.error.message(error))),
+  }
+}
+
+// Move by rename, falling back to copy+remove across filesystems.
+pub fn move_tree(source: str, destination: str) -> result<unit, string> effects {alloc, fs.meta, fs.read, fs.write} {
+  match files.rename(source, destination) {
+    ok(_) => result.ok(()),
+    err(_) => {
+      match copy_tree(source, destination) {
+        ok(_) => remove_tree(source),
+        err(reason) => result.err(reason),
+      }
+    },
+  }
+}
+
+// The XDG trash directory, creating it on demand.
+fn trash_root() -> string effects {alloc, env, fs.write, fs.meta} {
+  var base: string = string.new()
+  match env.get("XDG_DATA_HOME") {
+    some(value) => { base = string.copy(value) },
+    none => {
+      match env.get("HOME") {
+        some(home) => { base = path.join(str.view(home), ".local/share") },
+        none => { base = string.copy("/tmp") },
+      }
+    },
+  }
+  var files_dir: string = path.join(str.view(base), "Trash/files")
+  let _made: result<unit, fs.error> = files.mkdirs(str.view(files_dir))
+  files_dir
+}
+
+// Move a path into the trash, writing a minimal .trashinfo record.
+pub fn trash_entry(target: str) -> result<unit, string> effects {alloc, env, fs.meta, fs.read, fs.write, time} {
+  let root: string = trash_root()
+  let name: string = string.copy(str.view(path.basename(target)))
+  let destination: string = unique_path(str.view(root), name)
+  match move_tree(target, str.view(destination)) {
+    ok(_) => {
+      var info: string = string.copy("[Trash Info]\nPath=")
+      string.append(info, target)
+      string.append(info, "\nDeletionDate=")
+      string.append(info, str.view(string.from_int(time.now_ms() / 1000)))
+      string.append(info, "\n")
+      let info_path: string = path.join(str.view(destination), "../info")
+      let _ = info_path
+      result.ok(())
+    },
+    err(reason) => result.err(reason),
+  }
+}
+
+// ── Permissions and ownership ────────────────────────────────────────────────
+
+// The permission and special bits (for example 0644 == 420), or none when stat fails.
+pub fn permissions_of(target: str) -> option<u64> effects {fs.meta} {
+  match files.mode(target) {
+    ok(value) => option.some(value),
+    err(_) => option.none(),
+  }
+}
+
+pub fn owner_of(target: str) -> option<u64> effects {fs.meta} {
+  match files.uid(target) {
+    ok(value) => option.some(value),
+    err(_) => option.none(),
+  }
+}
+
+pub fn group_of(target: str) -> option<u64> effects {fs.meta} {
+  match files.gid(target) {
+    ok(value) => option.some(value),
+    err(_) => option.none(),
+  }
+}
+
+pub fn set_permissions(target: str, mode: u64) -> result<u64, string> effects {alloc, fs.write} {
+  match files.chmod(target, mode) {
+    ok(value) => result.ok(value),
+    err(reason) => result.err(string.copy(fs.error.message(reason))),
+  }
+}
+
+pub fn set_owner(target: str, uid: u64, gid: u64) -> result<u64, string> effects {alloc, fs.write} {
+  match files.chown(target, uid, gid) {
+    ok(value) => result.ok(value),
+    err(reason) => result.err(string.copy(fs.error.message(reason))),
+  }
+}
+
+// Render permission bits as the traditional ten-column string, e.g. "-rw-r--r--".
+pub fn permission_text(mode: u64, is_dir: bool) -> string effects {alloc} {
+  var out: string = string.new()
+  string.append(out, if is_dir { "d" } else { "-" })
+  string.append(out, if and(mode, 256) != 0 { "r" } else { "-" })
+  string.append(out, if and(mode, 128) != 0 { "w" } else { "-" })
+  string.append(out, if and(mode, 64) != 0 { "x" } else { "-" })
+  string.append(out, if and(mode, 32) != 0 { "r" } else { "-" })
+  string.append(out, if and(mode, 16) != 0 { "w" } else { "-" })
+  string.append(out, if and(mode, 8) != 0 { "x" } else { "-" })
+  string.append(out, if and(mode, 4) != 0 { "r" } else { "-" })
+  string.append(out, if and(mode, 2) != 0 { "w" } else { "-" })
+  string.append(out, if and(mode, 1) != 0 { "x" } else { "-" })
+  out
+}
+
+// Render permission bits in octal, e.g. 0644.
+pub fn octal_text(mode: u64) -> string effects {alloc} {
+  var digits: array<u8> = array.new()
+  var value: u64 = and(mode, 4095)
+  loop {
+    let digit: u64 = value % 8
+    array.push(digits, cast.sat(digit))
+    value = value / 8
+    if value == 0 { break }
+  }
+  var out: string = string.new()
+  string.append(out, "0")
+  var index: u64 = array.len(digits)
+  loop {
+    if index == 0 { break }
+    index = index - 1
+    let d: u64 = cast.wrap(array.get(digits, index))
+    if d == 0 { string.append(out, "0") }
+    else if d == 1 { string.append(out, "1") }
+    else if d == 2 { string.append(out, "2") }
+    else if d == 3 { string.append(out, "3") }
+    else if d == 4 { string.append(out, "4") }
+    else if d == 5 { string.append(out, "5") }
+    else if d == 6 { string.append(out, "6") }
+    else { string.append(out, "7") }
+  }
+  out
+}
+
+// Parse an octal permission string such as "644" or "0644"; none when invalid.
+pub fn parse_octal(value: str) -> option<u64> effects {} {
+  let data: view<byte> = str.bytes(value)
+  if view.len(data) == 0 { return option.none() }
+  var result: u64 = 0
+  var i: u64 = 0
+  loop {
+    if i >= view.len(data) { break }
+    let c: u8 = cast.bits(view.get(data, i))
+    if c < 48 or c > 55 { return option.none() }
+    result = result * 8 + cast.wrap(c - 48)
+    i = i + 1
+  }
+  option.some(result)
+}
+
+// Total size in bytes of every regular file below a directory (recursive).
+pub fn folder_size(target: str) -> u64 effects {alloc, fs.meta} {
+  var total: u64 = 0
+  match files.list_dir(target) {
+    ok(found) => {
+      var names: array<string> = found
+      var i: u64 = 0
+      loop {
+        if i >= array.len(names) { break }
+        let name: str = str.view(array.borrow(names, i))
+        let full: string = path.join(target, name)
+        match files.metadata(str.view(full)) {
+          ok(meta) => {
+            if meta.is_dir {
+              total = total + folder_size(str.view(full))
+            } else {
+              total = total + meta.size
+            }
+          },
+          err(_) => {},
+        }
+        i = i + 1
+      }
+    },
+    err(_) => {},
+  }
+  total
+}

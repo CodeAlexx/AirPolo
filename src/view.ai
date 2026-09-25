@@ -1,0 +1,607 @@
+// AirPolo presentation: turns the browsing model into a widget tree.
+module airpolo.view
+
+import std.files as files
+import std.widgets as w
+import std.text as text
+import std.path as path
+import "../toolkit/format.ai" as fmt
+import "../toolkit/fsops.ai" as fsops
+import "../toolkit/mounts.ai" as mounts
+import "../toolkit/thumbnails.ai" as thumbs
+import "../toolkit/icons.ai" as icons
+import std.draw as draw
+import std.image as image
+import "../toolkit/uiscale.ai" as uiscale
+import "../toolkit/theme.ai" as app_theme
+import "model.ai" as model
+
+pub fn key_root() -> u64 effects {} { 1 }
+pub fn key_title() -> u64 effects {} { 2 }
+pub fn key_toolbar() -> u64 effects {} { 3 }
+pub fn key_back() -> u64 effects {} { 4 }
+pub fn key_forward() -> u64 effects {} { 5 }
+pub fn key_up() -> u64 effects {} { 6 }
+pub fn key_home() -> u64 effects {} { 7 }
+pub fn key_new() -> u64 effects {} { 8 }
+pub fn key_delete() -> u64 effects {} { 9 }
+pub fn key_copy() -> u64 effects {} { 10 }
+pub fn key_paste() -> u64 effects {} { 11 }
+pub fn key_checksum() -> u64 effects {} { 12 }
+pub fn key_properties() -> u64 effects {} { 13 }
+pub fn key_archive() -> u64 effects {} { 14 }
+pub fn key_extract() -> u64 effects {} { 15 }
+pub fn key_hidden() -> u64 effects {} { 16 }
+pub fn key_filter() -> u64 effects {} { 17 }
+pub fn key_sort_name() -> u64 effects {} { 18 }
+pub fn key_sort_size() -> u64 effects {} { 19 }
+pub fn key_sort_time() -> u64 effects {} { 20 }
+pub fn key_tabs() -> u64 effects {} { 21 }
+pub fn key_new_tab() -> u64 effects {} { 22 }
+pub fn key_close_tab() -> u64 effects {} { 23 }
+pub fn key_places() -> u64 effects {} { 24 }
+pub fn key_files() -> u64 effects {} { 25 }
+pub fn key_status() -> u64 effects {} { 26 }
+pub fn key_progress() -> u64 effects {} { 27 }
+pub fn key_message() -> u64 effects {} { 28 }
+pub fn key_rename() -> u64 effects {} { 29 }
+pub fn key_open() -> u64 effects {} { 30 }
+pub fn key_dual() -> u64 effects {} { 70 }
+pub fn key_focus() -> u64 effects {} { 71 }
+pub fn key_copy_other() -> u64 effects {} { 72 }
+pub fn key_bookmark() -> u64 effects {} { 73 }
+pub fn key_terminal() -> u64 effects {} { 74 }
+pub fn key_files_other() -> u64 effects {} { 75 }
+pub fn key_cancel_job() -> u64 effects {} { 76 }
+pub fn key_toggle_view() -> u64 effects {} { 77 }
+pub fn key_search() -> u64 effects {} { 78 }
+pub fn key_browse() -> u64 effects {} { 79 }
+pub fn key_actions() -> u64 effects {} { 80 }
+pub fn key_pane2() -> u64 effects {} { 101 }
+pub fn key_pane3() -> u64 effects {} { 102 }
+pub fn key_pane_tab_new_base() -> u64 effects {} { 10000 }
+pub fn key_pane_tab_close_base() -> u64 effects {} { 10100 }
+pub fn key_pane_tab_base() -> u64 effects {} { 11000 }
+pub fn key_layout_base() -> u64 effects {} { 700 }
+pub fn key_permissions() -> u64 effects {} { 81 }
+pub fn key_settings() -> u64 effects {} { 82 }
+pub fn key_icon_base() -> u64 effects {} { 1000 }
+pub fn key_bookmark_base() -> u64 effects {} { 200 }
+pub fn key_mount_base() -> u64 effects {} { 300 }
+pub fn key_place_base() -> u64 effects {} { 40 }
+
+pub fn key_dialog() -> u64 effects {} { 60 }
+pub fn key_dialog_title() -> u64 effects {} { 61 }
+pub fn key_dialog_text() -> u64 effects {} { 62 }
+pub fn key_dialog_value() -> u64 effects {} { 63 }
+pub fn key_dialog_ok() -> u64 effects {} { 64 }
+pub fn key_dialog_cancel() -> u64 effects {} { 65 }
+pub fn key_theme_background_base() -> u64 effects {} { 620 }
+pub fn key_theme_accent_base() -> u64 effects {} { 640 }
+pub fn key_theme_revert() -> u64 effects {} { 647 }
+pub fn key_source_theme_base() -> u64 effects {} { 680 }
+
+fn glyph(kind: str) -> string effects {alloc} {
+  if str.eq(kind, "folder") { return string.copy("[D] ") }
+  if str.eq(kind, "image") { return string.copy("[I] ") }
+  if str.eq(kind, "video") { return string.copy("[V] ") }
+  if str.eq(kind, "audio") { return string.copy("[A] ") }
+  if str.eq(kind, "archive") { return string.copy("[Z] ") }
+  if str.eq(kind, "document") { return string.copy("[P] ") }
+  if str.eq(kind, "link") { return string.copy("[L] ") }
+  string.copy("[F] ")
+}
+
+fn places() -> array<string> effects {alloc, env} {
+  var out: array<string> = array.new()
+  match env.get("HOME") {
+    some(home) => {
+      array.push(out, string.copy(str.view(home)))
+      array.push(out, text.concat(str.view(home), "/Downloads"))
+      array.push(out, text.concat(str.view(home), "/Documents"))
+      array.push(out, text.concat(str.view(home), "/Pictures"))
+      array.push(out, text.concat(str.view(home), "/Music"))
+      array.push(out, text.concat(str.view(home), "/Videos"))
+    },
+    none => {},
+  }
+  array.push(out, string.copy("/"))
+  array.push(out, string.copy("/tmp"))
+  out
+}
+
+// Number of hard lines in a dialog body, so the label is tall enough to show them all.
+fn line_count(value: str) -> u64 effects {} {
+  let raw: view<byte> = str.bytes(value)
+  var lines: u64 = 1
+  var i: u64 = 0
+  loop {
+    if i >= view.len(raw) { break }
+    if view.get(raw, i) == 10 { lines = lines + 1 }
+    i = i + 1
+  }
+  lines
+}
+
+fn place_name(value: str) -> string effects {alloc} {
+  if str.eq(value, "/") { return string.copy("/ (root)") }
+  string.copy(value)
+}
+
+fn color_of(value: u64) -> draw.Color effects {} {
+  draw.rgb(cast.sat(app_theme.red(value)), cast.sat(app_theme.green(value)), cast.sat(app_theme.blue(value)))
+}
+
+fn color_picture(value: u64) -> draw.Surface effects {alloc} {
+  match draw.surface(48, 24) {
+    some(surface) => {
+      var picture: draw.Surface = surface
+      var canvas: draw.Canvas = draw.canvas(picture)
+      draw.clear(canvas, color_of(value))
+      draw.finish(canvas)
+    },
+    none => draw.empty_surface(),
+  }
+}
+
+fn theme_picture(background: u64, accent: u64) -> draw.Surface effects {alloc} {
+  match draw.surface(48, 24) {
+    some(surface) => {
+      var picture: draw.Surface = surface
+      var canvas: draw.Canvas = draw.canvas(picture)
+      draw.clear(canvas, color_of(background))
+      draw.fill_device_rect(canvas, 34, 0, 48, 24, color_of(accent))
+      draw.finish(canvas)
+    },
+    none => draw.empty_surface(),
+  }
+}
+
+fn color_choice(ui: ref<w.Ui>, key: u64, parent: u64, s: u64, label: str,
+                value: u64) -> unit effects {alloc} {
+  let item: u64 = w.panel(ui, key + 100, parent, true, uiscale.px(s, 74), 0, uiscale.px(s, 3), 0)
+  var picture: draw.Surface = color_picture(value)
+  let swatch: u64 = w.image_button(ui, key, item, uiscale.px(s, 34), "", picture)
+  w.tooltip(ui, swatch, label)
+  let _name: u64 = w.label(ui, key + 200, item, uiscale.px(s, 16), label)
+  ()
+}
+
+fn theme_choice(ui: ref<w.Ui>, key: u64, parent: u64, s: u64, label: str,
+                index: u64) -> unit effects {alloc} {
+  let item: u64 = w.panel(ui, key + 100, parent, true, uiscale.px(s, 125), 0, uiscale.px(s, 3), 0)
+  var picture: draw.Surface = theme_picture(app_theme.source_theme_background(index), app_theme.source_theme_accent(index))
+  let swatch: u64 = w.image_button(ui, key, item, uiscale.px(s, 48), "", picture)
+  w.tooltip(ui, swatch, label)
+  let _name: u64 = w.label(ui, key + 200, item, uiscale.px(s, 16), label)
+  ()
+}
+
+// A toolbar action: an icon (cached per frame) with an optional label and a tooltip.
+fn tool_button(ui: ref<w.Ui>, key: u64, parent: u64, s: u64, icon: str, label: str,
+               tip: str, cache: ref<array<icons.IconEntry>>) -> u64 effects {alloc} {
+  var picture: draw.Surface = icons.action_cached(cache, icon, 18)
+  var width: u64 = 36
+  if str.len(label) != 0 { width = 44 + cast.wrap(str.len(label)) * 9 }
+  let index: u64 = w.image_button(ui, key, parent, uiscale.px(s, cast.wrap(width)), label, picture)
+  w.tooltip(ui, index, tip)
+  index
+}
+
+pub type ThumbEntry = struct { path: string, surface: draw.Surface }
+
+// A small rolling hash over the path bytes, used to name the on-disk thumbnail cache file.
+fn hash_path(value: str) -> u64 effects {} {
+  let data: view<byte> = str.bytes(value)
+  var hash: u64 = 0
+  var i: u64 = 0
+  loop {
+    if i >= view.len(data) { break }
+    let raw: u8 = cast.bits(view.get(data, i))
+    hash = (hash * 131 + cast.wrap(raw)) % 1000000007
+    i = i + 1
+  }
+  hash
+}
+
+fn copy_surface(source: ref<draw.Surface>) -> draw.Surface effects {alloc} {
+  let copy: bytes = draw.surface_rgba(source)
+  let data: view<byte> = bytes.view(copy)
+  var pixels: array<byte> = array.new()
+  var at: u64 = 0
+  loop {
+    if at >= view.len(data) { break }
+    array.push(pixels, view.get(data, at))
+    at = at + 1
+  }
+  draw.Surface {
+    width: draw.surface_width(source), height: draw.surface_height(source), pixels: pixels
+  }
+}
+
+// A thumbnail for an image or video entry, remembered per frame so each path is
+// decoded once. Returns none for kinds without a preview.
+fn thumb_for(state: ref<model.State>, target: str, name: str, edge: u32, cache: ref<array<ThumbEntry>>) -> option<draw.Surface> effects {alloc, fs.meta, fs.read, fs.write, process} {
+  if not thumbs.supports(name) { return option.none() }
+  var i: u64 = 0
+  loop {
+    if i >= array.len(cache) { break }
+    let entry: ref<ThumbEntry> = array.borrow(cache, i)
+    if str.eq(str.view(entry.path), target) { return option.some(copy_surface(struct.borrow(entry, field=surface))) }
+    i = i + 1
+  }
+  var key: string = string.copy(str.view(state.run_dir))
+  string.append(key, "/thumb-")
+  let tag: i64 = cast.wrap(hash_path(target))
+  string.append(key, str.view(string.from_int(tag)))
+  string.append(key, "-")
+  let wide: i64 = cast.wrap(edge)
+  string.append(key, str.view(string.from_int(wide)))
+  string.append(key, ".png")
+  // Reuse a previously written thumbnail; only decode the source on a cache miss.
+  match files.exists(str.view(key)) {
+    ok(present) => {
+      if present {
+        match files.read_bytes(str.view(key)) {
+          ok(raw) => {
+            match image.decode_png(bytes.view(raw)) {
+              ok(surface) => {
+                var small: draw.Surface = surface
+                array.push(cache, ThumbEntry {path: string.copy(target), surface: small})
+                return option.some(copy_surface(struct.borrow(array.borrow(cache, array.len(cache) - 1), field=surface)))
+              },
+              err(_) => {},
+            }
+          },
+          err(_) => {},
+        }
+      }
+    },
+    err(_) => {},
+  }
+  var work: string = string.copy(str.view(state.run_dir))
+  string.append(work, "/thumb-work")
+  match thumbs.for_path(target, str.view(work), edge) {
+    some(value) => {
+      var picture: draw.Surface = value
+      let encoded: bytes = image.encode_png(picture)
+      let _w: result<unit, fs.error> = files.write_bytes(str.view(key), bytes.view(encoded))
+      array.push(cache, ThumbEntry {path: string.copy(target), surface: picture})
+      option.some(copy_surface(struct.borrow(array.borrow(cache, array.len(cache) - 1), field=surface)))
+    },
+    none => option.none(),
+  }
+}
+
+// One list row: a leading file-type icon plus the name/size/kind/path cells. The icon
+// cache keeps one rendered surface per distinct kind for the whole frame.
+fn push_list_row(ui: ref<w.Ui>, table: u64, item: ref<fsops.Entry>, cache: ref<array<icons.IconEntry>>,
+                   thumbs_cache: ref<array<ThumbEntry>>, state: ref<model.State>) -> unit effects {alloc, fs.meta, fs.read, fs.write, process} {
+  var picture: draw.Surface = draw.empty_surface()
+  var made: bool = false
+  if not fsops.is_dir_of(item) {
+    match thumb_for(state, str.view(fsops.path_of(item)), str.view(fsops.name_of(item)), 32, thumbs_cache) {
+      some(value) => { picture = value
+        made = true },
+      none => {},
+    }
+  }
+  if not made { picture = icons.cached(cache, str.view(fsops.kind_label(item)), 18) }
+  w.push_row_picture(ui, table, picture)
+  w.push_cell(ui, table, str.view(fsops.name_of(item)))
+  w.push_cell(ui, table, str.view(fmt.human_size(fsops.size_of(item))))
+  w.push_cell(ui, table, str.view(fsops.kind_label(item)))
+  w.push_cell(ui, table, str.view(fsops.path_of(item)))
+  ()
+}
+
+// One pane's file table, driven by the generic pane accessors so single, dual and
+// quad layouts share one renderer.
+fn pane_table(ui: ref<w.Ui>, key: u64, pane: u64, parent: u64, s: u64, state: ref<model.State>,
+              icon_cache: ref<array<icons.IconEntry>>, thumb_cache: ref<array<ThumbEntry>>) -> u64 effects {alloc, fs.meta, fs.read, fs.write, process} {
+  let box: u64 = w.panel(ui, 12000 + pane, parent, true, 0, 1, uiscale.px(s, 2), 0)
+  let tabbar: u64 = w.panel(ui, 12100 + pane, box, false, uiscale.px(s, 24), 0, uiscale.px(s, 3), 0)
+  let _new: u64 = w.button(ui, key_pane_tab_new_base() + pane, tabbar, uiscale.px(s, 28), "+")
+  let _close: u64 = w.button(ui, key_pane_tab_close_base() + pane, tabbar, uiscale.px(s, 28), "×")
+  var t: u64 = 0
+  loop {
+    if t >= model.pane_tab_count(state, pane) { break }
+    let directory: string = model.pane_tab_dir(state, pane, t)
+    var label: string = string.copy(str.view(path.basename(str.view(directory))))
+    if str.len(str.view(label)) == 0 { label = string.copy("/") }
+    if t == model.pane_active(state, pane) { string.append(label, " •") }
+    let tab_key: u64 = key_pane_tab_base() + pane * 128 + t
+    let _tab: u64 = w.button(ui, tab_key, tabbar, uiscale.px(s, 92), str.view(label))
+    t = t + 1
+  }
+  let table: u64 = w.table(ui, key, box, 0, 3, 4)
+  w.set_multi_select(ui, table, true)
+  w.stretch(ui, table, 1)
+  w.push_header(ui, table, "name")
+  w.push_header(ui, table, "size")
+  w.push_header(ui, table, "kind")
+  w.push_header(ui, table, "path")
+  var indices: array<u64> = model.pane_visible(state, pane)
+  var i: u64 = 0
+  loop {
+    if i >= array.len(indices) { break }
+    match model.pane_entry_at(state, pane, i) {
+      some(value) => {
+        var item: fsops.Entry = value
+        push_list_row(ui, table, item, icon_cache, thumb_cache, state)
+      },
+      none => {},
+    }
+    i = i + 1
+  }
+  if array.len(indices) == 0 { w.mark_status(ui, table, w.status_empty(), "Empty") }
+  table
+}
+
+pub fn build(ui: ref<w.Ui>, state: ref<model.State>) -> unit effects {alloc, env, fs.meta, fs.read, fs.write, process} {
+  let s: u64 = state.scale
+  var icon_cache: array<icons.IconEntry> = array.new()
+  var thumb_cache: array<ThumbEntry> = array.new()
+  var grid_cache: array<ThumbEntry> = array.new()
+  w.begin(ui)
+  let root: u64 = w.panel(ui, key_root(), 0, true, 0, 1, uiscale.px(s, 6), uiscale.px(s, 8))
+
+  let title: u64 = w.label(ui, key_title(), root, uiscale.px(s, 16), str.view(model.current_dir(state)))
+
+  let toolbar: u64 = w.panel(ui, key_toolbar(), root, false, uiscale.px(s, 30), 0, uiscale.px(s, 6), 0)
+  let _b: u64 = tool_button(ui, key_back(), toolbar, s, "back", "Back", "Open the previous visited location", icon_cache)
+  let _f: u64 = tool_button(ui, key_forward(), toolbar, s, "forward", "Forward", "Open the next visited location", icon_cache)
+  let _u: u64 = tool_button(ui, key_up(), toolbar, s, "up", "Up", "Open the parent location", icon_cache)
+  let _h: u64 = tool_button(ui, key_home(), toolbar, s, "home", "Home", "Open Home folder", icon_cache)
+  let _open: u64 = tool_button(ui, key_open(), toolbar, s, "open", "Open", "Open the selected item", icon_cache)
+  let _n: u64 = tool_button(ui, key_new(), toolbar, s, "new-folder", "New Folder", "Create a new folder", icon_cache)
+  let _rename: u64 = tool_button(ui, key_rename(), toolbar, s, "rename", "Rename", "Rename the selected item", icon_cache)
+  let _c: u64 = tool_button(ui, key_copy(), toolbar, s, "copy", "Copy", "Copy selected items", icon_cache)
+  let _p: u64 = tool_button(ui, key_paste(), toolbar, s, "paste", "Paste", "Paste items here", icon_cache)
+  let _d: u64 = tool_button(ui, key_delete(), toolbar, s, "delete", "Delete", "Move the selection to trash", icon_cache)
+  let _term: u64 = tool_button(ui, key_terminal(), toolbar, s, "terminal", "Terminal", "Open a terminal in this folder", icon_cache)
+
+  let toolbar2: u64 = w.panel(ui, 94, root, false, uiscale.px(s, 30), 0, uiscale.px(s, 6), 0)
+  let _k: u64 = tool_button(ui, key_checksum(), toolbar2, s, "checksum", "Checksum", "Compute checksums for the selection", icon_cache)
+  let _r: u64 = tool_button(ui, key_properties(), toolbar2, s, "properties", "Properties", "Show file properties", icon_cache)
+  let _a: u64 = tool_button(ui, key_archive(), toolbar2, s, "compress", "Compress", "Create an archive from the selection", icon_cache)
+  let _x: u64 = tool_button(ui, key_extract(), toolbar2, s, "extract", "Extract", "Extract the selected archive", icon_cache)
+  let _browse: u64 = tool_button(ui, key_browse(), toolbar2, s, "open", "Browse", "List the contents of the archive", icon_cache)
+  let _actions: u64 = tool_button(ui, key_actions(), toolbar2, s, "actions", "Actions", "File actions for the selection", icon_cache)
+  let _perm: u64 = tool_button(ui, key_permissions(), toolbar2, s, "permissions", "Permissions", "Change permissions", icon_cache)
+  let _settings: u64 = tool_button(ui, key_settings(), toolbar2, s, "settings", "Settings", "Change application colors", icon_cache)
+  let _dual: u64 = tool_button(ui, key_dual(), toolbar2, s, "dual", "Dual", "Cycle pane layout", icon_cache)
+  let _l1: u64 = tool_button(ui, key_layout_base(), toolbar2, s, "view-grid", "", "Single pane", icon_cache)
+  let _l2: u64 = tool_button(ui, key_layout_base() + 1, toolbar2, s, "dual", "", "Two panes side by side", icon_cache)
+  let _l3: u64 = tool_button(ui, key_layout_base() + 2, toolbar2, s, "view-list", "", "Two panes stacked", icon_cache)
+  let _l4: u64 = tool_button(ui, key_layout_base() + 3, toolbar2, s, "focus", "", "Four panes", icon_cache)
+  let _focus: u64 = tool_button(ui, key_focus(), toolbar2, s, "focus", "Focus", "Switch the active pane", icon_cache)
+  let _co: u64 = tool_button(ui, key_copy_other(), toolbar2, s, "folder-copy", "Copy Other", "Copy the selection to the other pane", icon_cache)
+  let _bm: u64 = tool_button(ui, key_bookmark(), toolbar2, s, "bookmarks", "Bookmark", "Bookmark the current folder", icon_cache)
+  var view_icon: string = string.copy("view-grid")
+  var view_label: string = string.copy("Icons")
+  if state.view_mode == 1 {
+    view_icon = string.copy("view-list")
+    view_label = string.copy("List")
+  }
+  let _view: u64 = tool_button(ui, key_toggle_view(), toolbar2, s, str.view(view_icon), str.view(view_label), "Switch between icon and list view", icon_cache)
+  let _search: u64 = tool_button(ui, key_search(), toolbar2, s, "search", "Search", "Search below this folder", icon_cache)
+  let _sn: u64 = tool_button(ui, key_sort_name(), toolbar2, s, "view-list", "Name", "Sort by name", icon_cache)
+  let _ss: u64 = tool_button(ui, key_sort_size(), toolbar2, s, "view-list", "Size", "Sort by size", icon_cache)
+  let _st: u64 = tool_button(ui, key_sort_time(), toolbar2, s, "view-list", "Date", "Sort by date", icon_cache)
+  let hidden: u64 = w.checkbox(ui, key_hidden(), toolbar2, uiscale.px(s, 84), "Hidden", state.show_hidden)
+  let filter: u64 = w.field(ui, key_filter(), toolbar2, uiscale.px(s, 200), str.view(struct.borrow(array.borrow(struct.borrow(state, field=tabs), state.active), field=filter)))
+  w.stretch(ui, filter, 1)
+
+  let tabs: u64 = w.panel(ui, key_tabs(), root, false, uiscale.px(s, 26), 0, uiscale.px(s, 6), 0)
+  let _nt: u64 = w.button(ui, key_new_tab(), tabs, uiscale.px(s, 120), "New focused tab")
+  let _ct: u64 = w.button(ui, key_close_tab(), tabs, uiscale.px(s, 120), "Close focused tab")
+
+  let middle: u64 = w.panel(ui, 90, root, false, 0, 1, uiscale.px(s, 8), 0)
+  let side: u64 = w.panel(ui, 91, middle, true, uiscale.px(s, 220), 0, uiscale.px(s, 4), 0)
+  var bookmarks: array<string> = places()
+  var p: u64 = 0
+  loop {
+    if p >= array.len(bookmarks) { break }
+    let _place: u64 = w.button(ui, key_place_base() + p, side, uiscale.px(s, 24), str.view(place_name(str.view(array.borrow(bookmarks, p)))))
+    p = p + 1
+  }
+  var marks: u64 = 0
+  loop {
+    if marks >= model.bookmark_count(state) { break }
+    match model.bookmark_at(state, marks) {
+      some(value) => {
+        var label: string = string.copy("★ ")
+        string.append(label, str.view(value))
+        let _b: u64 = w.button(ui, key_bookmark_base() + marks, side, uiscale.px(s, 24), str.view(label))
+      },
+      none => {},
+    }
+    marks = marks + 1
+  }
+  var mo: u64 = 0
+  loop {
+    if mo >= model.mount_count(state) { break }
+    match model.mount_at(state, mo) {
+      some(value) => {
+        var item: mounts.Mount = value
+        var label: string = string.copy("● ")
+        string.append(label, str.view(mounts.device_of(item)))
+        string.append(label, " → ")
+        string.append(label, str.view(mounts.point_of(item)))
+        let _m: u64 = w.button(ui, key_mount_base() + mo, side, uiscale.px(s, 24), str.view(label))
+      },
+      none => {},
+    }
+    mo = mo + 1
+  }
+
+  if state.layout == 3 {
+    model.open_quad_tabs(state)
+    let quad_rows: u64 = w.panel(ui, 104, middle, true, 0, 1, uiscale.px(s, 4), 0)
+    let quad_top: u64 = w.panel(ui, 105, quad_rows, false, 0, 1, 0, uiscale.px(s, 4))
+    let _q0: u64 = pane_table(ui, key_files(), 0, quad_top, s, state, icon_cache, thumb_cache)
+    let _q1: u64 = pane_table(ui, key_files_other(), 1, quad_top, s, state, icon_cache, thumb_cache)
+    let quad_bottom: u64 = w.panel(ui, 106, quad_rows, false, 0, 1, 0, uiscale.px(s, 4))
+    let _q2: u64 = pane_table(ui, key_pane2(), 2, quad_bottom, s, state, icon_cache, thumb_cache)
+    let _q3: u64 = pane_table(ui, key_pane3(), 3, quad_bottom, s, state, icon_cache, thumb_cache)
+  } else if state.dual {
+    var tables_parent: u64 = middle
+    if state.layout == 2 {
+      tables_parent = w.panel(ui, 95, middle, true, 0, 1, uiscale.px(s, 4), 0)
+    }
+    let other_first: bool = state.focus != 0
+    if other_first {
+      let _o: u64 = pane_table(ui, key_files_other(), 1, tables_parent, s, state, icon_cache, thumb_cache)
+      let _f: u64 = pane_table(ui, key_files(), 0, tables_parent, s, state, icon_cache, thumb_cache)
+    } else {
+      let _f: u64 = pane_table(ui, key_files(), 0, tables_parent, s, state, icon_cache, thumb_cache)
+      let _o: u64 = pane_table(ui, key_files_other(), 1, tables_parent, s, state, icon_cache, thumb_cache)
+    }
+  } else if state.view_mode == 1 {
+    let grid: u64 = w.panel(ui, 93, middle, true, 0, 1, uiscale.px(s, 6), 0)
+    var indices2: array<u64> = model.visible(state)
+    var row: u64 = 0
+    var col: u64 = 0
+    var row_panel: u64 = 0
+    var gi: u64 = 0
+    var thumb_count: u64 = 0
+    loop {
+      if gi >= array.len(indices2) { break }
+      if col == 0 {
+        row_panel = w.panel(ui, 400 + row, grid, false, uiscale.px(s, 130), 0, uiscale.px(s, 8), 0)
+      }
+      match model.entry_at_visible(state, gi) {
+        some(value) => {
+          var item: fsops.Entry = value
+          let entry_name: string = fsops.name_of(item)
+          let tile: u64 = w.panel(ui, 500 + gi, row_panel, true, uiscale.px(s, 140), 0, uiscale.px(s, 2), uiscale.px(s, 2))
+          var made: bool = false
+          if thumb_count < 48 and thumbs.supports(str.view(entry_name)) {
+            match thumb_for(state, str.view(fsops.path_of(item)), str.view(entry_name), 128, grid_cache) {
+              some(surface) => {
+                var picture: draw.Surface = surface
+                let _img: u64 = w.image_button(ui, key_icon_base() + gi, tile, uiscale.px(s, 84), str.view(entry_name), picture)
+                thumb_count = thumb_count + 1
+                made = true
+              },
+              none => {},
+            }
+          }
+          if not made {
+            match icons.surface_for(str.view(fsops.kind_label(item)), 64) {
+              some(icon) => {
+                var picture2: draw.Surface = icon
+                let _ib: u64 = w.image_button(ui, key_icon_base() + gi, tile, uiscale.px(s, 64), str.view(entry_name), picture2)
+                made = true
+              },
+              none => {},
+            }
+          }
+          if not made {
+            let _icon: u64 = w.button(ui, key_icon_base() + gi, tile, uiscale.px(s, 40), str.view(entry_name))
+          }
+          let _name: u64 = w.button(ui, key_icon_base() + gi, tile, uiscale.px(s, 16), str.view(entry_name))
+        },
+        none => {},
+      }
+      col = col + 1
+      if col == 6 { col = 0
+        row = row + 1 }
+      gi = gi + 1
+    }
+  } else {
+    let _f: u64 = pane_table(ui, key_files(), 0, middle, s, state, icon_cache, thumb_cache)
+  }
+
+  var status: string = string.new()
+  string.append(status, str.view(string.from_int(model.visible_count(state))))
+  string.append(status, " items")
+  if model.clipboard_count(state) != 0 {
+    string.append(status, "   clipboard: ")
+    string.append(status, str.view(string.from_int(model.clipboard_count(state))))
+  }
+  let _status: u64 = w.label(ui, key_status(), root, uiscale.px(s, 14), str.view(status))
+
+  let jobrow: u64 = w.panel(ui, 92, root, false, uiscale.px(s, 22), 0, uiscale.px(s, 6), 0)
+  var bar_value: u64 = state.progress
+  var bar_total: u64 = state.total
+  if state.job_running {
+    bar_value = state.job_done
+    bar_total = state.job_total
+  }
+  let bar: u64 = w.progress(ui, key_progress(), jobrow, uiscale.px(s, 14), bar_value, bar_total, "Operations")
+  w.stretch(ui, bar, 1)
+  let _stop: u64 = w.button(ui, key_cancel_job(), jobrow, uiscale.px(s, 70), "Stop")
+  var message: string = string.copy(str.view(state.message))
+  if state.job_running { message = string.copy(str.view(state.job_message)) }
+  let _msg: u64 = w.label(ui, key_message(), root, uiscale.px(s, 14), str.view(message))
+
+  if state.dialog != model.dialog_none() {
+    if state.dialog == model.dialog_settings() {
+      let box: u64 = w.dialog(ui, key_dialog(), uiscale.px(s, 600), uiscale.px(s, 440), uiscale.px(s, 10), uiscale.px(s, 10), "Appearance")
+      let header: u64 = w.panel(ui, 667, box, false, uiscale.px(s, 30), 0, uiscale.px(s, 8), 0)
+      let intro: u64 = w.label(ui, 668, header, uiscale.px(s, 22), "Choices preview instantly. Save, Revert, or Close.")
+      w.stretch(ui, intro, 1)
+      let _close: u64 = w.button(ui, key_dialog_cancel(), header, uiscale.px(s, 90), "Close")
+      let _source_title: u64 = w.label(ui, 676, box, uiscale.px(s, 18), "Serenity themes")
+      let themes1: u64 = w.panel(ui, 678, box, false, uiscale.px(s, 58), 0, uiscale.px(s, 8), 0)
+      theme_choice(ui, key_source_theme_base(), themes1, s, "Serenity", 0)
+      theme_choice(ui, key_source_theme_base() + 1, themes1, s, "Moonlight", 1)
+      theme_choice(ui, key_source_theme_base() + 2, themes1, s, "Monochrome", 2)
+      theme_choice(ui, key_source_theme_base() + 3, themes1, s, "Nord", 3)
+      let themes2: u64 = w.panel(ui, 679, box, false, uiscale.px(s, 58), 0, uiscale.px(s, 8), 0)
+      theme_choice(ui, key_source_theme_base() + 4, themes2, s, "Cinder", 4)
+      theme_choice(ui, key_source_theme_base() + 5, themes2, s, "Blender", 5)
+      theme_choice(ui, key_source_theme_base() + 6, themes2, s, "Cyberpunk", 6)
+      let _theme_title: u64 = w.label(ui, 670, box, uiscale.px(s, 18), "Background override")
+      let backgrounds: u64 = w.panel(ui, 669, box, false, uiscale.px(s, 58), 0, uiscale.px(s, 8), 0)
+      color_choice(ui, key_theme_background_base(), backgrounds, s, "Light", app_theme.background_choice(0))
+      color_choice(ui, key_theme_background_base() + 1, backgrounds, s, "Dark", app_theme.background_choice(1))
+      color_choice(ui, key_theme_background_base() + 2, backgrounds, s, "Slate", app_theme.background_choice(2))
+      color_choice(ui, key_theme_background_base() + 3, backgrounds, s, "Ocean", app_theme.background_choice(3))
+      color_choice(ui, key_theme_background_base() + 4, backgrounds, s, "Warm", app_theme.background_choice(4))
+      let _ac_title: u64 = w.label(ui, 674, box, uiscale.px(s, 18), "Accent")
+      let choices: u64 = w.panel(ui, 677, box, false, uiscale.px(s, 58), 0, uiscale.px(s, 8), 0)
+      color_choice(ui, key_theme_accent_base(), choices, s, "Blue", app_theme.accent_choice(0))
+      color_choice(ui, key_theme_accent_base() + 1, choices, s, "Teal", app_theme.accent_choice(1))
+      color_choice(ui, key_theme_accent_base() + 2, choices, s, "Green", app_theme.accent_choice(2))
+      color_choice(ui, key_theme_accent_base() + 3, choices, s, "Amber", app_theme.accent_choice(3))
+      color_choice(ui, key_theme_accent_base() + 4, choices, s, "Rose", app_theme.accent_choice(4))
+      color_choice(ui, key_theme_accent_base() + 5, choices, s, "Violet", app_theme.accent_choice(5))
+      let row: u64 = w.panel(ui, 675, box, false, uiscale.px(s, 32), 0, uiscale.px(s, 8), 0)
+      let _revert: u64 = w.button(ui, key_theme_revert(), row, uiscale.px(s, 110), "Revert")
+      let _apply: u64 = w.button(ui, key_dialog_ok(), row, uiscale.px(s, 140), "Save colors")
+    } else {
+    // Size the dialog to its content so the OK/Cancel row is always reachable, and cap it
+    // to the window so it never extends past the visible area.
+    let lines: u64 = line_count(str.view(state.dialog_text))
+    let title_height: u64 = 26
+    let button_height: u64 = 50
+    let field_height: u64 = 34
+    var has_field: bool = false
+    if state.dialog == model.dialog_rename() or state.dialog == model.dialog_archive() or state.dialog == model.dialog_extract() or state.dialog == model.dialog_actions() or state.dialog == model.dialog_permissions() or state.dialog == model.dialog_pdf_password() {
+      has_field = true
+    }
+    // The value field's chrome is tall; reserve a fixed footer so OK/Cancel always fit,
+    // and cap the body. The dialog is a compact list, not a scrolling document.
+    var body_height: u64 = 16 * lines
+    if body_height > 320 { body_height = 320 }
+    var dialog_height: u64 = body_height + 480
+    if dialog_height > 780 { dialog_height = 780 }
+    if dialog_height < 220 { dialog_height = 220 }
+    let box: u64 = w.dialog(ui, key_dialog(), uiscale.px(s, 620), uiscale.px(s, dialog_height), uiscale.px(s, 8), uiscale.px(s, 10), str.view(state.dialog_title))
+    let _title_space: u64 = w.panel(ui, 67, box, false, uiscale.px(s, title_height), 0, 0, 0)
+    let body: u64 = w.label(ui, key_dialog_text(), box, uiscale.px(s, body_height), str.view(state.dialog_text))
+    if state.dialog == model.dialog_rename() or state.dialog == model.dialog_archive() or state.dialog == model.dialog_extract() or state.dialog == model.dialog_actions() or state.dialog == model.dialog_permissions() or state.dialog == model.dialog_pdf_password() {
+      let _field: u64 = w.field(ui, key_dialog_value(), box, uiscale.px(s, 320), str.view(state.dialog_value))
+    }
+    let row: u64 = w.panel(ui, 66, box, false, uiscale.px(s, 30), 0, uiscale.px(s, 8), 0)
+    let _ok: u64 = w.button(ui, key_dialog_ok(), row, uiscale.px(s, 110), "OK")
+    let _cancel: u64 = w.button(ui, key_dialog_cancel(), row, uiscale.px(s, 110), "Cancel")
+    }
+  }
+
+  w.finish(ui)
+  ()
+}

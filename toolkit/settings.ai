@@ -1,0 +1,230 @@
+// Reusable JSON settings + bookmarks persistence for AIR applications.
+module airpolo.toolkit.settings
+
+import std.files as files
+import std.json as json
+import std.path as path
+import std.text as text
+import "theme.ai" as app_theme
+
+// Current schema version. Bump when a field is added or its meaning changes and add a
+// migration step in `load` so older files keep working.
+pub fn schema_version() -> u64 effects {} { 3 }
+
+pub type Settings = struct {
+  version: u64,
+  show_hidden: bool,
+  sort_mode: u64,
+  view_mode: u64,
+  layout: u64,             // 0 single, 1 dual vertical, 2 dual horizontal, 3 quad
+  bookmarks: array<string>,
+  toolbar_labels: bool,
+  icon_size: u64,
+  confirm_delete: bool,
+  confirm_trash: bool,
+  thumbnails: bool,
+  thumbnail_size: u64,
+  show_status: bool,
+  show_sidebar: bool,
+  terminal: string,
+  columns: array<string>,
+  theme_background: u64,
+  theme_accent: u64
+}
+
+pub fn defaults() -> Settings effects {alloc} {
+  Settings {
+    version: schema_version(), show_hidden: false, sort_mode: 0, view_mode: 1, layout: 0,
+    bookmarks: array.new(), toolbar_labels: true, icon_size: 18,
+    confirm_delete: true, confirm_trash: true, thumbnails: true, thumbnail_size: 128,
+    show_status: true, show_sidebar: true, terminal: string.new(),
+    columns: default_columns(), theme_background: app_theme.default_background(),
+    theme_accent: app_theme.default_accent()
+  }
+}
+
+pub fn default_columns() -> array<string> effects {alloc} {
+  var out: array<string> = array.new()
+  array.push(out, string.copy("name"))
+  array.push(out, string.copy("size"))
+  array.push(out, string.copy("kind"))
+  array.push(out, string.copy("path"))
+  out
+}
+
+// Map a pre-version-2 `dual` flag onto the new layout field.
+fn layout_from_dual(dual: bool) -> u64 effects {} { if dual { 1 } else { 0 } }
+
+fn jstr(doc: ref<json.Document>, object: u64, key: str, fallback: str) -> string effects {alloc} {
+  match json.get(doc, object, key) {
+    some(index) => match json.as_string(doc, index) { some(value) => value, none => string.copy(fallback) },
+    none => string.copy(fallback),
+  }
+}
+
+fn jbool(doc: ref<json.Document>, object: u64, key: str, fallback: bool) -> bool effects {alloc} {
+  match json.get(doc, object, key) {
+    some(index) => match json.as_bool(doc, index) { some(value) => value, none => fallback },
+    none => fallback,
+  }
+}
+
+fn ju64(doc: ref<json.Document>, object: u64, key: str, fallback: u64) -> u64 effects {alloc} {
+  match json.get(doc, object, key) {
+    some(index) => match json.as_u64(doc, index) { some(value) => value, none => fallback },
+    none => fallback,
+  }
+}
+
+fn jarray(doc: ref<json.Document>, object: u64, key: str) -> array<string> effects {alloc} {
+  var out: array<string> = array.new()
+  match json.get(doc, object, key) {
+    some(index) => {
+      match json.len(doc, index) {
+        some(count) => {
+          var i: u64 = 0
+          loop {
+            if i >= count { break }
+            match json.at(doc, index, i) {
+              some(item) => match json.as_string(doc, item) { some(value) => array.push(out, value), none => {} },
+              none => {},
+            }
+            i = i + 1
+          }
+        },
+        none => {},
+      }
+    },
+    none => {},
+  }
+  out
+}
+
+pub fn load(path_value: str) -> Settings effects {alloc, fs.read, fs.meta} {
+  var out: Settings = defaults()
+  match files.read_text(path_value) {
+    ok(body) => {
+      match json.parse(str.view(body)) {
+        ok(found) => {
+          var doc: json.Document = found
+          let root: u64 = json.root()
+          let version: u64 = ju64(doc, root, "version", 1)
+          var layout: u64 = ju64(doc, root, "layout", 0)
+          if version < 2 { layout = layout_from_dual(jbool(doc, root, "dual", false)) }
+          var columns: array<string> = jarray(doc, root, "columns")
+          if array.len(columns) == 0 { columns = default_columns() }
+          out = Settings {
+            version: schema_version(),
+            show_hidden: jbool(doc, root, "show_hidden", false),
+            sort_mode: ju64(doc, root, "sort_mode", 0),
+            view_mode: ju64(doc, root, "view_mode", 0),
+            layout: layout,
+            bookmarks: jarray(doc, root, "bookmarks"),
+            toolbar_labels: jbool(doc, root, "toolbar_labels", true),
+            icon_size: ju64(doc, root, "icon_size", 18),
+            confirm_delete: jbool(doc, root, "confirm_delete", true),
+            confirm_trash: jbool(doc, root, "confirm_trash", true),
+            thumbnails: jbool(doc, root, "thumbnails", true),
+            thumbnail_size: ju64(doc, root, "thumbnail_size", 128),
+            show_status: jbool(doc, root, "show_status", true),
+            show_sidebar: jbool(doc, root, "show_sidebar", true),
+            terminal: jstr(doc, root, "terminal", ""),
+            columns: columns,
+            theme_background: ju64(doc, root, "theme_background", app_theme.default_background()) % 16777216,
+            theme_accent: ju64(doc, root, "theme_accent", app_theme.default_accent()) % 16777216
+          }
+        },
+        err(_) => {},
+      }
+    },
+    err(_) => {},
+  }
+  out
+}
+
+fn json_escape(value: str) -> string effects {alloc} {
+  var out: string = string.copy("\"")
+  var i: u64 = 0
+  loop {
+    if i >= str.len(value) { break }
+    let c: str = str.slice(value, i, i + 1)
+    if str.eq(c, "\"") or str.eq(c, "\\") { string.append(out, "\\") }
+    string.append(out, c)
+    i = i + 1
+  }
+  string.append(out, "\"")
+  out
+}
+
+fn put_u64(body: ref<string>, key: str, value: u64) -> unit effects {alloc} {
+  string.append(body, key)
+  let wide: i64 = cast.wrap(value)
+  let rendered: string = string.from_int(wide)
+  string.append(body, str.view(rendered))
+  ()
+}
+
+fn put_bool(body: ref<string>, key: str, value: bool) -> unit effects {alloc} {
+  string.append(body, key)
+  if value { string.append(body, "true") } else { string.append(body, "false") }
+  ()
+}
+
+fn put_str_array(body: ref<string>, key: str, values: ref<array<string>>) -> unit effects {alloc} {
+  string.append(body, key)
+  string.append(body, "[")
+  var i: u64 = 0
+  loop {
+    if i >= array.len(values) { break }
+    if i != 0 { string.append(body, ", ") }
+    string.append(body, json_escape(str.view(array.borrow(values, i))))
+    i = i + 1
+  }
+  string.append(body, "]")
+  ()
+}
+
+pub fn save(path_value: str, state: ref<Settings>) -> unit effects {alloc, fs.read, fs.write, fs.meta} {
+  var body: string = string.copy("{\n  ")
+  put_u64(body, "\"version\": ", schema_version())
+  string.append(body, ",\n  ")
+  put_bool(body, "\"show_hidden\": ", state.show_hidden)
+  string.append(body, ",\n  ")
+  put_u64(body, "\"sort_mode\": ", state.sort_mode)
+  string.append(body, ",\n  ")
+  put_u64(body, "\"view_mode\": ", state.view_mode)
+  string.append(body, ",\n  ")
+  put_u64(body, "\"layout\": ", state.layout)
+  string.append(body, ",\n  ")
+  put_bool(body, "\"toolbar_labels\": ", state.toolbar_labels)
+  string.append(body, ",\n  ")
+  put_u64(body, "\"icon_size\": ", state.icon_size)
+  string.append(body, ",\n  ")
+  put_bool(body, "\"confirm_delete\": ", state.confirm_delete)
+  string.append(body, ",\n  ")
+  put_bool(body, "\"confirm_trash\": ", state.confirm_trash)
+  string.append(body, ",\n  ")
+  put_bool(body, "\"thumbnails\": ", state.thumbnails)
+  string.append(body, ",\n  ")
+  put_u64(body, "\"thumbnail_size\": ", state.thumbnail_size)
+  string.append(body, ",\n  ")
+  put_bool(body, "\"show_status\": ", state.show_status)
+  string.append(body, ",\n  ")
+  put_bool(body, "\"show_sidebar\": ", state.show_sidebar)
+  string.append(body, ",\n  ")
+  string.append(body, "\"terminal\": ")
+  string.append(body, json_escape(str.view(state.terminal)))
+  string.append(body, ",\n  ")
+  put_str_array(body, "\"columns\": ", struct.borrow(state, field=columns))
+  string.append(body, ",\n  ")
+  put_u64(body, "\"theme_background\": ", state.theme_background)
+  string.append(body, ",\n  ")
+  put_u64(body, "\"theme_accent\": ", state.theme_accent)
+  string.append(body, ",\n  ")
+  put_str_array(body, "\"bookmarks\": ", struct.borrow(state, field=bookmarks))
+  string.append(body, "\n}\n")
+  let _written: result<unit, fs.error> = files.write_text(path_value, str.view(body))
+  ()
+}
+
+fn value_show_hidden(state: ref<Settings>) -> bool effects {} { state.show_hidden }

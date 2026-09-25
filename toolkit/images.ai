@@ -1,0 +1,228 @@
+// Reusable image operations for a file manager: load/save PNG and JPEG, rotate, resize and
+// grayscale, built on std.image, std.jpeg and std.image_ops (no external tools).
+module airpolo.toolkit.images
+
+import std.files as files
+import std.image as image
+import std.image_ops as ops
+import std.jpeg as jpeg
+import std.draw as draw
+import std.path as path
+import std.text as text
+
+pub type Image = struct {
+  width: u32,
+  height: u32,
+  data: ops.Image
+}
+
+pub fn load(target: str) -> option<Image> effects {alloc, fs.read, fs.meta} {
+  let ext: string = text.lower_ascii(str.view(path.extension(target)))
+  if str.eq(str.view(ext), ".png") {
+    match files.read_bytes(target) {
+      ok(raw) => match image.decode_png(bytes.view(raw)) {
+        ok(surface) => {
+          var srf: draw.Surface = surface
+          match ops.from_surface(srf) {
+            some(value) => { return option.some(Image {width: value.width, height: value.height, data: value}) },
+            none => {},
+          }
+        },
+        err(_) => {},
+      },
+      err(_) => {},
+    }
+  } else if str.eq(str.view(ext), ".jpg") or str.eq(str.view(ext), ".jpeg") {
+    match jpeg.load(target) {
+      ok(loaded) => {
+        var img: jpeg.Image = loaded
+        match jpeg.to_surface(img) {
+          ok(surface) => {
+            var srf: draw.Surface = surface
+            match ops.from_surface(srf) {
+              some(value) => { return option.some(Image {width: value.width, height: value.height, data: value}) },
+              none => {},
+            }
+          },
+          err(_) => {},
+        }
+      },
+      err(_) => {},
+    }
+  }
+  option.none()
+}
+
+pub fn save_png(value: ref<Image>, target: str) -> result<unit, string> effects {alloc, fs.read, fs.write, fs.meta} {
+  match ops.to_surface(value.data) {
+    some(surface) => {
+      var srf: draw.Surface = surface
+      let encoded: bytes = image.encode_png(srf)
+      match files.write_bytes(target, bytes.view(encoded)) {
+        ok(_) => result.ok(()),
+        err(error) => result.err(string.copy(fs.error.message(error))),
+      }
+    },
+    none => result.err(string.copy("cannot encode PNG")),
+  }
+}
+
+pub fn save_jpeg(value: ref<Image>, target: str, quality: i64) -> result<unit, string> effects {alloc, fs.read, fs.write, fs.meta} {
+  match ops.to_surface(value.data) {
+    some(surface) => {
+      var srf: draw.Surface = surface
+      match jpeg.from_surface(srf) {
+        ok(converted) => {
+          var img: jpeg.Image = converted
+          match jpeg.save(img, target, quality) {
+            ok(_) => result.ok(()),
+            err(_) => result.err(string.copy("cannot save JPEG")),
+          }
+        },
+        err(_) => result.err(string.copy("cannot convert to JPEG")),
+      }
+    },
+    none => result.err(string.copy("cannot encode JPEG")),
+  }
+}
+
+// Rotate by a multiple of 90 degrees clockwise.
+pub fn rotate90(value: ref<Image>, clockwise: bool) -> option<Image> effects {alloc} {
+  let w: u32 = value.width
+  let h: u32 = value.height
+  match ops.create(h, w, value.data.color_space, value.data.sample_format) {
+    some(out) => {
+      var dst: ops.Image = out
+      var x: u32 = 0
+      loop {
+        if x >= w { break }
+        var y: u32 = 0
+        loop {
+          if y >= h { break }
+          var nx: u32 = 0
+          var ny: u32 = 0
+          if clockwise {
+            nx = h - 1 - y
+            ny = x
+          } else {
+            nx = y
+            ny = w - 1 - x
+          }
+          var c: u32 = 0
+          loop {
+            if c >= value.data.channels { break }
+            match ops.get_u8(value.data, x, y, c) {
+              some(v) => { let _ = ops.set_u8(dst, nx, ny, c, v) },
+              none => {},
+            }
+            c = c + 1
+          }
+          y = y + 1
+        }
+        x = x + 1
+      }
+      option.some(Image {width: h, height: w, data: dst})
+    },
+    none => option.none(),
+  }
+}
+
+// Nearest-neighbour resize to the given dimensions.
+pub fn resize(value: ref<Image>, target_w: u32, target_h: u32) -> option<Image> effects {alloc} {
+  let w: u32 = value.width
+  let h: u32 = value.height
+  if w == 0 or h == 0 or target_w == 0 or target_h == 0 { return option.none() }
+  match ops.create(target_w, target_h, value.data.color_space, value.data.sample_format) {
+    some(out) => {
+      var dst: ops.Image = out
+      let w64: u64 = cast.wrap(w)
+      let h64: u64 = cast.wrap(h)
+      let tw64: u64 = cast.wrap(target_w)
+      let th64: u64 = cast.wrap(target_h)
+      var x: u32 = 0
+      loop {
+        if x >= target_w { break }
+        let x64: u64 = cast.wrap(x)
+        let sx: u32 = cast.wrap(x64 * w64 / tw64)
+        var y: u32 = 0
+        loop {
+          if y >= target_h { break }
+          let y64: u64 = cast.wrap(y)
+          let sy: u32 = cast.wrap(y64 * h64 / th64)
+          var c: u32 = 0
+          loop {
+            if c >= value.data.channels { break }
+            match ops.get_u8(value.data, sx, sy, c) {
+              some(v) => { let _ = ops.set_u8(dst, x, y, c, v) },
+              none => {},
+            }
+            c = c + 1
+          }
+          y = y + 1
+        }
+        x = x + 1
+      }
+      option.some(Image {width: target_w, height: target_h, data: dst})
+    },
+    none => option.none(),
+  }
+}
+
+pub fn grayscale(value: ref<Image>) -> option<Image> effects {alloc} {
+  match ops.to_gray(value.data) {
+    some(gray) => option.some(Image {width: gray.width, height: gray.height, data: gray}),
+    none => option.none(),
+  }
+}
+
+fn duplicate_surface(source: ref<draw.Surface>) -> draw.Surface effects {alloc} {
+  let copy: bytes = draw.surface_rgba(source)
+  let data: view<byte> = bytes.view(copy)
+  var pixels: array<byte> = array.new()
+  var at: u64 = 0
+  loop {
+    if at >= view.len(data) { break }
+    array.push(pixels, view.get(data, at))
+    at = at + 1
+  }
+  draw.Surface {
+    width: draw.surface_width(source), height: draw.surface_height(source), pixels: pixels
+  }
+}
+
+// Downscale a surface so its longest edge is at most `max_edge`, preserving aspect.
+// Used for list thumbnails where decoding full-size images would be wasteful.
+pub fn fit_surface(source: ref<draw.Surface>, max_edge: u32) -> option<draw.Surface> effects {alloc} {
+  let width: u32 = draw.surface_width(source)
+  let height: u32 = draw.surface_height(source)
+  if width == 0 or height == 0 { return option.none() }
+  let longest: u32 = if width > height { width } else { height }
+  if longest <= max_edge { return option.some(duplicate_surface(source)) }
+  var target_w: u32 = max_edge
+  var target_h: u32 = max_edge
+  if width >= height {
+    let scaled: u64 = cast.wrap(height) * cast.wrap(max_edge) / cast.wrap(width)
+    target_h = cast.sat(scaled)
+    if target_h == 0 { target_h = 1 }
+  } else {
+    let scaled: u64 = cast.wrap(width) * cast.wrap(max_edge) / cast.wrap(height)
+    target_w = cast.sat(scaled)
+    if target_w == 0 { target_w = 1 }
+  }
+  match ops.from_surface(source) {
+    some(converted) => {
+      var image_value: Image = Image {width: converted.width, height: converted.height, data: converted}
+      match resize(image_value, target_w, target_h) {
+        some(small) => {
+          var result: Image = small
+          match ops.to_surface(result.data) {
+            some(surface) => option.some(surface),
+            none => option.none(),
+          }
+        },
+        none => option.none(),
+      }
+    },
+    none => option.none(),
+  }
+}

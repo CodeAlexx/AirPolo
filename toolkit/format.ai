@@ -1,0 +1,85 @@
+// Reusable display and classification helpers for file-manager style applications.
+//
+// Kept free of UI and application state so other AIR applications can import it directly
+// (or lift it into an AIR toolkit) for human-readable sizes, file kinds and names.
+module airpolo.toolkit.format
+
+import std.text as text
+import std.path as path
+
+pub fn human_size(value: u64) -> string effects {alloc} {
+  if value < 1024 { return text.concat(str.view(string.from_int(value)), " B") }
+  let kb: u64 = value / 1024
+  if kb < 1024 { return text.concat(str.view(string.from_int(kb)), " KiB") }
+  let mb: u64 = kb / 1024
+  if mb < 1024 { return text.concat(str.view(string.from_int(mb)), " MiB") }
+  let gb: u64 = mb / 1024
+  if gb < 1024 { return text.concat(str.view(string.from_int(gb)), " GiB") }
+  text.concat(str.view(string.from_int(gb / 1024)), " TiB")
+}
+
+// Extension without the leading dot, lowercased.
+fn ext_of(name: str) -> string effects {alloc} {
+  let raw: string = path.extension(name)
+  if str.starts_with(str.view(raw), ".") {
+    return string.copy(str.slice(str.view(raw), 1, str.len(str.view(raw))))
+  }
+  string.copy(str.view(raw))
+}
+
+// A short human label for a directory entry kind, driven by the extension.
+pub fn kind_of(name: str, is_dir: bool, is_link: bool) -> string effects {alloc} {
+  if is_link { return string.copy("link") }
+  if is_dir { return string.copy("folder") }
+  let ext: string = text.lower_ascii(str.view(ext_of(name)))
+  if str.len(str.view(ext)) == 0 { return string.copy("file") }
+  if str.eq(str.view(ext), "png") or str.eq(str.view(ext), "jpg") or str.eq(str.view(ext), "jpeg")
+     or str.eq(str.view(ext), "webp") or str.eq(str.view(ext), "gif") or str.eq(str.view(ext), "bmp") {
+    return string.copy("image")
+  }
+  if str.eq(str.view(ext), "mp4") or str.eq(str.view(ext), "mkv") or str.eq(str.view(ext), "webm")
+     or str.eq(str.view(ext), "mov") or str.eq(str.view(ext), "avi") {
+    return string.copy("video")
+  }
+  if str.eq(str.view(ext), "mp3") or str.eq(str.view(ext), "flac") or str.eq(str.view(ext), "wav")
+     or str.eq(str.view(ext), "m4a") or str.eq(str.view(ext), "ogg") or str.eq(str.view(ext), "opus") {
+    return string.copy("audio")
+  }
+  if str.eq(str.view(ext), "zip") or str.eq(str.view(ext), "tar") or str.eq(str.view(ext), "gz")
+     or str.eq(str.view(ext), "7z") or str.eq(str.view(ext), "rar") or str.eq(str.view(ext), "xz")
+     or str.eq(str.view(ext), "bz2") or str.eq(str.view(ext), "zst") {
+    return string.copy("archive")
+  }
+  if str.eq(str.view(ext), "pdf") { return string.copy("document") }
+  if str.eq(str.view(ext), "ai") or str.eq(str.view(ext), "air") { return string.copy("AIR source") }
+  if str.eq(str.view(ext), "md") or str.eq(str.view(ext), "txt") { return string.copy("text") }
+  if str.eq(str.view(ext), "sh") or str.eq(str.view(ext), "c") or str.eq(str.view(ext), "cpp")
+     or str.eq(str.view(ext), "py") or str.eq(str.view(ext), "rs") or str.eq(str.view(ext), "go")
+     or str.eq(str.view(ext), "mojo") or str.eq(str.view(ext), "vala") {
+    return string.copy("code")
+  }
+  text.copy(str.view(ext))
+}
+
+pub fn is_archive_name(name: str) -> bool effects {alloc} {
+  let ext: string = text.lower_ascii(str.view(ext_of(name)))
+  if str.eq(str.view(ext), "zip") or str.eq(str.view(ext), "7z") or str.eq(str.view(ext), "rar")
+     or str.eq(str.view(ext), "tar") or str.eq(str.view(ext), "gz") or str.eq(str.view(ext), "xz")
+     or str.eq(str.view(ext), "bz2") or str.eq(str.view(ext), "zst") {
+    return true
+  }
+  false
+}
+
+pub fn is_image_name(name: str) -> bool effects {alloc} {
+  let ext: string = text.lower_ascii(str.view(ext_of(name)))
+  if str.eq(str.view(ext), "png") or str.eq(str.view(ext), "jpg") or str.eq(str.view(ext), "jpeg")
+     or str.eq(str.view(ext), "webp") or str.eq(str.view(ext), "bmp") {
+    return true
+  }
+  false
+}
+
+pub fn is_pdf_name(name: str) -> bool effects {alloc} {
+  str.eq(str.view(text.lower_ascii(str.view(ext_of(name)))), "pdf")
+}

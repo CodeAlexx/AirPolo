@@ -1,0 +1,76 @@
+// Reusable background file transfer: copy or move a list of paths into a destination, with a
+// small tab-separated progress document and cooperative cancellation via a signal file.
+// The worker owns no UI state, so an application spawns it on a task and polls the document.
+module airpolo.toolkit.transfer
+
+import std.files as files
+import std.path as path
+import std.tasks as tasks
+import std.text as text
+import "fsops.ai" as fsops
+
+pub type Plan = struct {
+  sources: array<string>,
+  dest_dir: string,
+  cut: bool,
+  signal: string,
+  progress: string
+}
+
+pub type Outcome = struct {
+  copied: u64,
+  failed: u64,
+  stopped: bool,
+  message: string
+}
+
+fn write_progress(progress_path: str, done: u64, total: u64, message: str) -> unit effects {alloc, fs.write} {
+  var body: string = string.from_int(done)
+  string.append(body, "\t")
+  string.append(body, str.view(string.from_int(total)))
+  string.append(body, "\t")
+  string.append(body, message)
+  string.append(body, "\n")
+  let _written: result<unit, fs.error> = files.write_text(progress_path, str.view(body))
+  ()
+}
+
+pub fn run(plan: Plan own) -> Outcome effects {alloc, env, fs.meta, fs.read, fs.write, time} {
+  var owned: Plan = plan
+  let dest: string = string.copy(owned.dest_dir)
+  let signal: string = string.copy(owned.signal)
+  let progress_path: string = string.copy(owned.progress)
+  let total: u64 = array.len(owned.sources)
+  var copied: u64 = 0
+  var failed: u64 = 0
+  var stopped: bool = false
+  var last_error: string = string.new()
+  let _made: result<unit, fs.error> = files.mkdirs(str.view(dest))
+  var i: u64 = 0
+  loop {
+    if i >= array.len(owned.sources) { break }
+    if str.len(str.view(signal)) != 0 and tasks.requested_at(str.view(signal)) {
+      stopped = true
+      break
+    }
+    let source: string = string.copy(str.view(array.borrow(owned.sources, i)))
+    let name: string = string.copy(str.view(path.basename(str.view(source))))
+    let target: string = fsops.unique_path(str.view(dest), str.view(name))
+    let outcome: result<unit, string> = if owned.cut {
+      fsops.move_tree(str.view(source), str.view(target))
+    } else {
+      fsops.copy_tree(str.view(source), str.view(target))
+    }
+    match outcome {
+      ok(_) => { copied = copied + 1 },
+      err(reason) => {
+        failed = failed + 1
+        last_error = reason
+      },
+    }
+    write_progress(str.view(progress_path), copied + failed, total, str.view(name))
+    i = i + 1
+  }
+  write_progress(str.view(progress_path), copied + failed, total, str.view(last_error))
+  Outcome {copied: copied, failed: failed, stopped: stopped, message: last_error}
+}

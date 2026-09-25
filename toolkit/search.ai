@@ -1,0 +1,49 @@
+// Reusable bounded recursive filename search.
+module airpolo.toolkit.search
+
+import std.files as files
+import std.path as path
+import std.text as text
+
+pub type Hit = struct {
+  path: string,
+  name: string,
+  is_dir: bool
+}
+
+fn walk(root: str, needle: str, hits: ref<array<Hit>>, limit: u64, depth: u64) -> unit effects {alloc, fs.meta} {
+  if depth > 8 { return () }
+  if array.len(hits) >= limit { return () }
+  match files.list_dir(root) {
+    ok(found) => {
+      var names: array<string> = found
+      var i: u64 = 0
+      loop {
+        if i >= array.len(names) { break }
+        if array.len(hits) >= limit { break }
+        let name: str = str.view(array.borrow(names, i))
+        if not (str.eq(name, ".") or str.eq(name, "..")) {
+          var full: string = path.join(root, name)
+          let is_dir: bool = match files.is_dir(str.view(full)) { ok(value) => value, err(_) => false }
+          let lower: string = text.lower_ascii(name)
+          if text.contains(str.view(lower), needle) {
+            array.push(hits, Hit {path: string.copy(str.view(full)), name: string.copy(name), is_dir: is_dir})
+          }
+          if is_dir and not str.starts_with(name, ".") {
+            walk(str.view(full), needle, hits, limit, depth + 1)
+          }
+        }
+        i = i + 1
+      }
+    },
+    err(_) => {},
+  }
+  ()
+}
+
+pub fn find(root: str, needle: str, limit: u64) -> array<Hit> effects {alloc, fs.meta} {
+  var hits: array<Hit> = array.new()
+  let lowered: string = text.lower_ascii(needle)
+  if str.len(str.view(lowered)) != 0 { walk(root, str.view(lowered), hits, limit, 0) }
+  hits
+}

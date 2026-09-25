@@ -1,0 +1,2084 @@
+// AirPolo entry point: a native AIR file manager (Polo port).
+//
+//   airpolo [--path DIR] [--render DIR] [--list DIR] [--hidden]
+//
+// `--render DIR` is the display-free gate: it draws the browser and a dialog and writes PPM
+// frames. `--list DIR` prints a directory listing for the toolkit tests.
+module airpolo.main
+
+import std.cli as cli
+import std.files as files
+import std.draw as draw
+import std.image as image
+import std.gui as gui
+import std.path as path
+import std.pdf as pdf
+import std.pdf_security as pdf_security
+import std.process as proc
+import std.text as text
+import std.time as clock
+import std.widgets as w
+import std.desktop_styles as styles
+import std.shell as shell
+import "../toolkit/format.ai" as fmt
+import "../toolkit/fsops.ai" as fsops
+import "../toolkit/checksums.ai" as sums
+import "../toolkit/archive.ai" as archive
+import "../toolkit/images.ai" as images
+import "../toolkit/uiscale.ai" as uiscale
+import "../toolkit/mounts.ai" as mounts
+import "../toolkit/transfer.ai" as transfer
+import "../toolkit/watch.ai" as watch
+import "../toolkit/theme.ai" as app_theme
+import std.tasks as tasks
+import "model.ai" as model
+import "view.ai" as page
+
+fn log_path(name: str) -> string effects {alloc, env} {
+  match env.get("XDG_CACHE_HOME") {
+    some(base) => path.join(str.view(base), name),
+    none => {
+      match env.get("HOME") {
+        some(home) => path.join(str.view(home), str.view(text.concat(".cache/", name))),
+        none => string.copy("/tmp/airpolo.log"),
+      }
+    },
+  }
+}
+
+// Load a scalable system font at a size proportional to the UI scale; falls back to the
+// built-in bitmap font when no TrueType file is found.
+fn load_font(ui: ref<w.Ui>, factor: u64) -> bool effects {alloc, fs.meta, fs.read} {
+  var candidates: array<string> = array.new()
+  array.push(candidates, string.copy("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"))
+  array.push(candidates, string.copy("/usr/share/fonts/TTF/DejaVuSans.ttf"))
+  array.push(candidates, string.copy("/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf"))
+  var i: u64 = 0
+  loop {
+    if i >= array.len(candidates) { break }
+    let path_value: str = str.view(array.borrow(candidates, i))
+    match files.is_file(path_value) {
+      ok(found) => {
+        if found { return w.use_font(ui, path_value, 13 * factor) }
+      },
+      err(_) => {},
+    }
+    i = i + 1
+  }
+  false
+}
+
+fn relayout(ui: ref<w.Ui>, state: ref<model.State>) -> unit effects {alloc, env, fs.meta, fs.read, fs.write, process} {
+  page.build(ui, state)
+  ()
+}
+
+fn apply_theme(ui: ref<w.Ui>, state: ref<model.State>) -> unit effects {} {
+  styles.set_theme(ui, app_theme.palette(state.theme_background, state.theme_accent))
+  ()
+}
+
+fn repaint(app: ref<shell.Shell>, ui: ref<w.Ui>) -> unit effects {alloc, ui} {
+  shell.paint(app, ui)
+  match shell.present(app) { ok(_) => {}, err(_) => {} }
+  ()
+}
+
+fn open_in_pane(state: ref<model.State>, pane: u64) -> unit effects {alloc, env, fs.meta, process, fs.read} {
+  match model.pane_selected_entry(state, pane) {
+    some(value) => {
+      var entry: fsops.Entry = value
+      let target: string = fsops.path_of(entry)
+      if fsops.is_dir_of(entry) {
+        model.pane_navigate(state, pane, str.view(target))
+      } else {
+        var argv: array<string> = array.new()
+        array.push(argv, string.copy("xdg-open"))
+        array.push(argv, target)
+        let _ = proc.run(argv, "/", str.view(log_path("airpolo-open.log")), false)
+        model.set_message(state, "opened")
+      }
+    },
+    none => {},
+  }
+  ()
+}
+
+fn open_selected(state: ref<model.State>) -> unit effects {alloc, env, fs.meta, process, fs.read} {
+  open_in_pane(state, state.focus)
+  ()
+}
+
+fn open_dialog(state: ref<model.State>, kind: u64) -> unit effects {alloc, env, fs.meta, fs.read, process} {
+  match model.pane_selected_entry(state, state.focus) {
+    some(value) => {
+      var entry: fsops.Entry = value
+      let name: string = fsops.name_of(entry)
+      var entry_path: string = fsops.path_of(entry)
+      struct.set(state, kind, field=dialog)
+      let _p: string = struct.replace(state, string.copy(str.view(entry_path)), field=dialog_path)
+      if kind == model.dialog_properties() {
+        let _t: string = struct.replace(state, string.copy("Properties"), field=dialog_title)
+        var body: string = string.copy("Name: ")
+        string.append(body, str.view(name))
+        string.append(body, "\nType: ")
+        string.append(body, str.view(fsops.kind_label(entry)))
+        string.append(body, "\nSize: ")
+        string.append(body, str.view(fmt.human_size(fsops.size_of(entry))))
+        let size_bytes: i64 = cast.wrap(fsops.size_of(entry))
+        string.append(body, " (")
+        string.append(body, str.view(string.from_int(size_bytes)))
+        string.append(body, " bytes)")
+        string.append(body, "\nLocation: ")
+        string.append(body, str.view(path.dirname(str.view(entry_path))))
+        string.append(body, "\nPath: ")
+        string.append(body, str.view(fsops.path_of(entry)))
+        string.append(body, "\nModified: ")
+        string.append(body, str.view(clock.format_ns(cast.wrap(fsops.mtime_of(entry)))))
+        string.append(body, "\nPermissions: ")
+        match fsops.permissions_of(str.view(entry_path)) {
+          some(bits) => {
+            string.append(body, str.view(fsops.octal_text(bits)))
+            string.append(body, "  ")
+            string.append(body, str.view(fsops.permission_text(bits, entry.is_dir)))
+          },
+          none => { string.append(body, "unknown") },
+        }
+        string.append(body, "\nOwner: ")
+        match fsops.owner_of(str.view(entry_path)) {
+          some(value) => {
+            let wide: i64 = cast.wrap(value)
+            string.append(body, str.view(string.from_int(wide)))
+          },
+          none => { string.append(body, "unknown") },
+        }
+        string.append(body, "\nGroup: ")
+        match fsops.group_of(str.view(entry_path)) {
+          some(value) => {
+            let wide: i64 = cast.wrap(value)
+            string.append(body, str.view(string.from_int(wide)))
+          },
+          none => { string.append(body, "unknown") },
+        }
+        let _x: string = struct.replace(state, body, field=dialog_text)
+      } else if kind == model.dialog_permissions() {
+        let _t: string = struct.replace(state, string.copy("Permissions"), field=dialog_title)
+        let _x: string = struct.replace(state, string.copy("Octal mode (for example 644):"), field=dialog_text)
+        var mode_text: string = string.copy("644")
+        match fsops.permissions_of(str.view(entry_path)) {
+          some(bits) => { mode_text = fsops.octal_text(bits) },
+          none => {},
+        }
+        let _v: string = struct.replace(state, mode_text, field=dialog_value)
+      } else if kind == model.dialog_rename() {
+        let _t: string = struct.replace(state, string.copy("Rename"), field=dialog_title)
+        let _x: string = struct.replace(state, string.copy("New name:"), field=dialog_text)
+        let _v: string = struct.replace(state, name, field=dialog_value)
+      } else if kind == model.dialog_archive() {
+        let _t: string = struct.replace(state, string.copy("Create archive"), field=dialog_title)
+        let _x: string = struct.replace(state, string.copy("Archive name:"), field=dialog_text)
+        var archive_name: string = string.copy(str.view(path.stem(str.view(name))))
+        string.append(archive_name, ".7z")
+        let _v: string = struct.replace(state, archive_name, field=dialog_value)
+      } else if kind == model.dialog_extract() {
+        let _t: string = struct.replace(state, string.copy("Extract archive"), field=dialog_title)
+        let _x: string = struct.replace(state, string.copy("Destination folder:"), field=dialog_text)
+        let _v: string = struct.replace(state, string.copy(str.view(path.stem(str.view(name)))), field=dialog_value)
+      } else if kind == model.dialog_browse() {
+        let _t: string = struct.replace(state, string.copy("Archive contents"), field=dialog_title)
+        var body: string = string.new()
+        match archive.list_entries(str.view(entry_path), str.view(log_path("airpolo-7z.log"))) {
+          ok(found) => {
+            var entries: array<string> = found
+            var n: u64 = 0
+            loop {
+              if n >= array.len(entries) { break }
+              if n >= 100 { break }
+              string.append(body, str.view(array.borrow(entries, n)))
+              string.append(body, "\n")
+              n = n + 1
+            }
+            if array.len(entries) == 0 { string.append(body, "(empty archive)") }
+          },
+          err(reason) => { string.append(body, str.view(reason)) },
+        }
+        let _x: string = struct.replace(state, body, field=dialog_text)
+      } else if kind == model.dialog_confirm_delete() {
+        let _t: string = struct.replace(state, string.copy("Move to trash"), field=dialog_title)
+        let count: u64 = model.pane_selection_count(state, state.focus)
+        var question: string = string.copy("Move ")
+        string.append(question, str.view(string.from_int(count)))
+        string.append(question, " selected item(s) to the trash?")
+        let _x: string = struct.replace(state, question, field=dialog_text)
+      } else if kind == model.dialog_confirm_permanent_delete() {
+        let _t: string = struct.replace(state, string.copy("Delete permanently"), field=dialog_title)
+        let count: u64 = model.pane_selection_count(state, state.focus)
+        var question: string = string.copy("Permanently delete ")
+        string.append(question, str.view(string.from_int(count)))
+        string.append(question, " selected item(s)? This cannot be undone.")
+        let _x: string = struct.replace(state, question, field=dialog_text)
+      }
+    },
+    none => { model.set_message(state, "select an item first") },
+  }
+  ()
+}
+
+fn close_dialog(state: ref<model.State>) -> unit effects {} {
+  if state.dialog == model.dialog_settings() { model.cancel_settings(state) }
+  else { struct.set(state, 0, field=dialog) }
+  ()
+}
+
+fn do_paste(state: ref<model.State>) -> unit effects {alloc, env, fs.meta, fs.read, fs.write} {
+  let dest_dir: string = model.focused_dir(state)
+  var done: u64 = 0
+  var i: u64 = 0
+  loop {
+    if i >= array.len(struct.borrow(state, field=clipboard)) { break }
+    let source: string = string.copy(str.view(array.borrow(state.clipboard, i)))
+    let name: string = string.copy(str.view(path.basename(str.view(source))))
+    let target: string = fsops.unique_path(str.view(dest_dir), str.view(name))
+    let outcome: result<unit, string> = if state.clip_cut {
+      fsops.move_tree(str.view(source), str.view(target))
+    } else {
+      fsops.copy_tree(str.view(source), str.view(target))
+    }
+    match outcome {
+      ok(_) => { done = done + 1 },
+      err(reason) => { model.set_message(state, str.view(reason)) },
+    }
+    i = i + 1
+  }
+  let old: array<string> = ref.swap(struct.borrow(state, field=clipboard), array.new())
+  struct.set(state, false, field=clip_cut)
+  model.refresh(state)
+  var note: string = string.copy("pasted ")
+  string.append(note, str.view(string.from_int(done)))
+  model.set_message(state, str.view(note))
+  ()
+}
+
+fn dialog_ok(state: ref<model.State>, value: str, pending: ref<array<transfer.Plan>>) -> unit effects {alloc, env, fs.meta, fs.read, fs.write, process, time} {
+  let kind: u64 = state.dialog
+  let target: string = string.copy(state.dialog_path)
+  if kind == model.dialog_confirm_delete() {
+    var entries: array<fsops.Entry> = model.selected_entries(state)
+    var moved: u64 = 0
+    var i: u64 = 0
+    loop {
+      if i >= array.len(entries) { break }
+      match fsops.trash_entry(array.borrow(entries, i).path) {
+        ok(_) => { moved = moved + 1 },
+        err(reason) => { model.set_message(state, str.view(reason)) },
+      }
+      i = i + 1
+    }
+    var note: string = string.copy("moved ")
+    string.append(note, str.view(string.from_int(moved)))
+    string.append(note, " item(s) to trash")
+    model.set_message(state, str.view(note))
+    model.refresh(state)
+  } else if kind == model.dialog_confirm_permanent_delete() {
+    var entries: array<fsops.Entry> = model.selected_entries(state)
+    var deleted: u64 = 0
+    var i: u64 = 0
+    loop {
+      if i >= array.len(entries) { break }
+      match fsops.remove_tree(array.borrow(entries, i).path) {
+        ok(_) => { deleted = deleted + 1 },
+        err(reason) => { model.set_message(state, str.view(reason)) },
+      }
+      i = i + 1
+    }
+    var note: string = string.copy("deleted ")
+    string.append(note, str.view(string.from_int(deleted)))
+    string.append(note, " item(s)")
+    model.set_message(state, str.view(note))
+    model.refresh_pane(state, state.focus)
+  } else if kind == model.dialog_rename() {
+    let dir: string = string.copy(str.view(path.dirname(str.view(target))))
+    let destination: string = path.join(str.view(dir), value)
+    match fsops.rename_entry(str.view(target), str.view(destination)) {
+      ok(_) => { model.set_message(state, "renamed") },
+      err(reason) => { model.set_message(state, str.view(reason)) },
+    }
+    model.refresh(state)
+  } else if kind == model.dialog_archive() {
+    let dir: string = model.focused_dir(state)
+    let destination: string = path.join(str.view(dir), value)
+    var members: array<string> = array.new()
+    var entries: array<fsops.Entry> = model.selected_entries(state)
+    var i: u64 = 0
+    loop {
+      if i >= array.len(entries) { break }
+      array.push(members, string.copy(array.borrow(entries, i).path))
+      i = i + 1
+    }
+    match archive.create(str.view(destination), members, str.view(log_path("airpolo-7z.log"))) {
+      ok(_) => { model.set_message(state, "archive created") },
+      err(reason) => { model.set_message(state, str.view(reason)) },
+    }
+    model.refresh(state)
+  } else if kind == model.dialog_extract() {
+    let dir: string = model.focused_dir(state)
+    let destination: string = model.resolve_dir(value, str.view(dir))
+    match archive.extract(str.view(target), str.view(destination), str.view(log_path("airpolo-7z.log"))) {
+      ok(_) => { model.set_message(state, "extracted") },
+      err(reason) => { model.set_message(state, str.view(reason)) },
+    }
+    model.refresh(state)
+  } else if kind == model.dialog_actions() {
+    run_action(state, value, pending)
+  } else if kind == model.dialog_pdf_password() {
+    let source: string = string.copy(state.dialog_path)
+    let folder: string = string.copy(str.view(path.dirname(str.view(source))))
+    let stem: string = string.copy(str.view(path.stem(str.view(source))))
+    var target: string = string.copy(folder)
+    string.append(target, "/")
+    string.append(target, str.view(stem))
+    if state.pdf_password_add { string.append(target, "-locked.pdf") } else { string.append(target, "-unlocked.pdf") }
+    if state.pdf_password_add {
+      match pdf_security.add_password_file(str.view(source), str.view(target), value, value) {
+        ok(_) => { model.set_message(state, "password added") },
+        err(error) => { model.set_message(state, str.view(pdf_security.error_code(error))) },
+      }
+    } else {
+      match pdf_security.remove_password_file(str.view(source), str.view(target), value) {
+        ok(_) => { model.set_message(state, "password removed") },
+        err(error) => { model.set_message(state, str.view(pdf_security.error_code(error))) },
+      }
+    }
+    model.refresh(state)
+  } else if kind == model.dialog_permissions() {
+    match fsops.parse_octal(value) {
+      some(bits) => {
+        match fsops.set_permissions(str.view(target), bits) {
+          ok(_) => { model.set_message(state, "permissions changed") },
+          err(reason) => { model.set_message(state, str.view(reason)) },
+        }
+      },
+      none => { model.set_message(state, "invalid octal mode") },
+    }
+    model.refresh(state)
+  }
+  close_dialog(state)
+  ()
+}
+
+fn open_terminal(state: ref<model.State>) -> unit effects {alloc, env, fs.meta, fs.read, process} {
+  let dir: string = model.focused_dir(state)
+  var argv: array<string> = array.new()
+  array.push(argv, string.copy("x-terminal-emulator"))
+  array.push(argv, string.copy("--working-directory"))
+  array.push(argv, string.copy(str.view(dir)))
+  let log: string = string.copy(str.view(log_path("airpolo-terminal.log")))
+  match proc.run(argv, str.view(dir), log, false) {
+    ok(status) => {
+      if proc.success(status) { model.set_message(state, "terminal opened") }
+      else {
+        var fallback: array<string> = array.new()
+        array.push(fallback, string.copy("xterm"))
+        let _ = proc.run(fallback, str.view(dir), log, false)
+        model.set_message(state, "terminal opened")
+      }
+    },
+    err(_) => { model.set_message(state, "no terminal emulator found") },
+  }
+  ()
+}
+
+fn enqueue_transfer(state: ref<model.State>, dest_dir: str, cut: bool, sources: array<string> own, pending: ref<array<transfer.Plan>>) -> unit effects {alloc, env, fs.write} {
+  let signal: string = text.concat(str.view(state.run_dir), "/transfer.signal")
+  let progress: string = text.concat(str.view(state.run_dir), "/transfer.progress")
+  let _removed: result<unit, fs.error> = files.remove(str.view(signal))
+  var list: array<string> = sources
+  let total: u64 = array.len(list)
+  model.start_job(state, str.view(signal), str.view(progress), total)
+  array.push(pending, transfer.Plan {
+    sources: list, dest_dir: string.copy(dest_dir), cut: cut,
+    signal: signal, progress: progress
+  })
+  ()
+}
+
+fn clipboard_copy(state: ref<model.State>) -> array<string> effects {alloc} {
+  var out: array<string> = array.new()
+  var i: u64 = 0
+  loop {
+    if i >= array.len(struct.borrow(state, field=clipboard)) { break }
+    array.push(out, string.copy(str.view(array.borrow(struct.borrow(state, field=clipboard), i))))
+    i = i + 1
+  }
+  out
+}
+
+fn copy_to_other(state: ref<model.State>) -> unit effects {alloc, env, fs.meta, fs.read, fs.write} {
+  var entries: array<fsops.Entry> = model.selected_entries(state)
+  if array.len(entries) == 0 { model.set_message(state, "select an item first")
+    return () }
+  var copied: u64 = 0
+  var i: u64 = 0
+  loop {
+    if i >= array.len(entries) { break }
+    let entry: ref<fsops.Entry> = array.borrow(entries, i)
+    let target: string = fsops.unique_path(str.view(model.opposite_dir(state)), entry.name)
+    match fsops.copy_tree(entry.path, str.view(target)) {
+      ok(_) => { copied = copied + 1 },
+      err(reason) => { model.set_message(state, str.view(reason)) },
+    }
+    i = i + 1
+  }
+  model.refresh_other(state)
+  var note: string = string.copy("copied ")
+  string.append(note, str.view(string.from_int(copied)))
+  string.append(note, " item(s) to the other pane")
+  model.set_message(state, str.view(note))
+  ()
+}
+
+fn do_checksum(state: ref<model.State>) -> unit effects {alloc, env, fs.meta, fs.read, process} {
+  match model.pane_selected_entry(state, state.focus) {
+    some(value) => {
+      var entry: fsops.Entry = value
+      let target: string = fsops.path_of(entry)
+      struct.set(state, model.dialog_checksums(), field=dialog)
+      let _t: string = struct.replace(state, string.copy("Checksums"), field=dialog_title)
+      var out: string = string.copy("SHA-256: ")
+      match sums.sha256_of(str.view(target)) {
+        ok(value) => { string.append(out, str.view(value)) },
+        err(reason) => { string.append(out, str.view(reason)) },
+      }
+      string.append(out, "\nMD5: ")
+      match sums.md5_of(str.view(target), str.view(log_path("airpolo-md5.log"))) {
+        ok(value) => { string.append(out, str.view(value)) },
+        err(reason) => { string.append(out, str.view(reason)) },
+      }
+      let _x: string = struct.replace(state, out, field=dialog_text)
+    },
+    none => { model.set_message(state, "select a file first") },
+  }
+  ()
+}
+
+// ── File-kind actions (PDF and images) ─────────────────────────────────────
+
+fn extension_of(entry: ref<fsops.Entry>) -> string effects {alloc} {
+  text.lower_ascii(str.view(path.extension(str.view(entry.path))))
+}
+
+fn is_pdf(entry: ref<fsops.Entry>) -> bool effects {alloc} {
+  str.eq(str.view(extension_of(entry)), ".pdf")
+}
+
+fn is_image(entry: ref<fsops.Entry>) -> bool effects {alloc} {
+  let ext: string = extension_of(entry)
+  str.eq(str.view(ext), ".png") or str.eq(str.view(ext), ".jpg") or str.eq(str.view(ext), ".jpeg")
+}
+
+fn extension_text(entry: ref<fsops.Entry>) -> string effects {alloc} {
+  extension_of(entry)
+}
+
+fn is_archive(entry: ref<fsops.Entry>) -> bool effects {alloc} {
+  let ext: string = extension_of(entry)
+  str.eq(str.view(ext), ".7z") or str.eq(str.view(ext), ".zip") or str.eq(str.view(ext), ".tar")
+    or str.eq(str.view(ext), ".gz") or str.eq(str.view(ext), ".xz") or str.eq(str.view(ext), ".bz2")
+    or str.eq(str.view(ext), ".rar") or str.eq(str.view(ext), ".tgz")
+}
+
+fn is_iso(entry: ref<fsops.Entry>) -> bool effects {alloc} {
+  str.eq(str.view(extension_of(entry)), ".iso")
+}
+
+fn is_disk_image(entry: ref<fsops.Entry>) -> bool effects {alloc} {
+  let ext: string = extension_of(entry)
+  str.eq(str.view(ext), ".img") or str.eq(str.view(ext), ".qcow2") or str.eq(str.view(ext), ".vdi")
+    or str.eq(str.view(ext), ".vmdk")
+}
+
+fn count_pdfs(state: ref<model.State>) -> u64 effects {alloc} {
+  var entries: array<fsops.Entry> = model.pane_visible_entries(state, state.focus)
+  var total: u64 = 0
+  var i: u64 = 0
+  loop {
+    if i >= array.len(entries) { break }
+    if is_pdf(array.borrow(entries, i)) { total = total + 1 }
+    i = i + 1
+  }
+  total
+}
+
+fn open_actions(state: ref<model.State>) -> unit effects {alloc, fs.meta} {
+  let pane: u64 = state.focus
+  var lines: string = string.new()
+  string.append(lines, "open             open the selected item\n")
+  string.append(lines, "open-tab         open the folder in a new tab\n")
+  string.append(lines, "open-terminal    open a terminal in this folder\n")
+  string.append(lines, "cut              cut the selection\n")
+  string.append(lines, "copy             copy the selection\n")
+  string.append(lines, "paste            paste into this folder\n")
+  string.append(lines, "rename           rename the selected item\n")
+  string.append(lines, "trash            move the selection to the recycle bin\n")
+  string.append(lines, "delete           delete permanently\n")
+  string.append(lines, "properties       show file properties\n")
+  string.append(lines, "permissions      change permissions\n")
+  string.append(lines, "checksum         compute checksums\n")
+  string.append(lines, "folder-size      calculate the folder size\n")
+  string.append(lines, "compress         create an archive from the selection\n")
+  string.append(lines, "extract-here     extract the archive in this folder\n")
+  string.append(lines, "extract-to       extract the archive to a folder\n")
+  string.append(lines, "browse           list the archive contents\n")
+  string.append(lines, "copy-across      copy the selection to the other pane\n")
+  string.append(lines, "move-across      move the selection to the other pane\n")
+  string.append(lines, "new-folder       create a new folder\n")
+  string.append(lines, "new-file         create a new file\n")
+  match model.pane_selected_entry(state, pane) {
+    some(value) => {
+      var entry: fsops.Entry = value
+      if is_pdf(entry) {
+        string.append(lines, "pdf-rotate-cw    rotate every page 90 clockwise\n")
+        string.append(lines, "pdf-rotate-ccw   rotate every page 90 counter-clockwise\n")
+        string.append(lines, "pdf-split        split into single pages\n")
+        string.append(lines, "pdf-uncompress   remove stream compression\n")
+        string.append(lines, "pdf-validate     check the document structure\n")
+        string.append(lines, "pdf-remove-color     convert colours to grayscale\n")
+        string.append(lines, "pdf-optimize         recompress streams to reduce size\n")
+        string.append(lines, "pdf-password-add     protect with a password\n")
+        string.append(lines, "pdf-password-remove  remove the password\n")
+      }
+      if is_image(entry) {
+        string.append(lines, "img-rotate-cw    rotate 90 clockwise\n")
+        string.append(lines, "img-rotate-ccw   rotate 90 counter-clockwise\n")
+        string.append(lines, "img-png          convert to PNG\n")
+        string.append(lines, "img-jpeg         convert to JPEG\n")
+        string.append(lines, "img-gray         convert to grayscale\n")
+      }
+      if is_archive(entry) {
+        string.append(lines, "extract-here     extract this archive here\n")
+      }
+    },
+    none => {},
+  }
+  if count_pdfs(state) >= 2 {
+    string.append(lines, "pdf-merge        merge all PDFs in this folder\n")
+  }
+  struct.set(state, model.dialog_actions(), field=dialog)
+  let _title: string = struct.replace(state, string.copy("Actions"), field=dialog_title)
+  let _body: string = struct.replace(state, lines, field=dialog_text)
+  let _value: string = struct.replace(state, string.new(), field=dialog_value)
+  ()
+}
+
+fn save_image(state: ref<model.State>, value: ref<images.Image>, target: str, extension: str) -> unit effects {alloc, fs.meta, fs.read, fs.write} {
+  if str.eq(extension, ".png") {
+    match images.save_png(value, target) {
+      ok(_) => { model.set_message(state, "image written") },
+      err(reason) => { model.set_message(state, str.view(reason)) },
+    }
+  } else {
+    match images.save_jpeg(value, target, 92) {
+      ok(_) => { model.set_message(state, "image written") },
+      err(reason) => { model.set_message(state, str.view(reason)) },
+    }
+  }
+  ()
+}
+
+fn suffixed(directory: str, stem: str, suffix: str, extension: str) -> string effects {alloc} {
+  let decorated: string = text.concat(stem, suffix)
+  let named: string = text.concat(str.view(decorated), extension)
+  path.join(directory, str.view(named))
+}
+
+fn transform_image(state: ref<model.State>, source: str, code: str) -> unit effects {alloc, fs.meta, fs.read, fs.write} {
+  let directory: string = string.copy(str.view(path.dirname(source)))
+  let stem: string = string.copy(str.view(path.stem(source)))
+  let extension: string = text.lower_ascii(str.view(path.extension(source)))
+  match images.load(source) {
+    some(loaded) => {
+      var picture: images.Image = loaded
+      if str.eq(code, "img-rotate-cw") or str.eq(code, "img-rotate-ccw") {
+        let clockwise: bool = str.eq(code, "img-rotate-cw")
+        match images.rotate90(picture, clockwise) {
+          some(result) => {
+            var rotated: images.Image = result
+            let target: string = suffixed(str.view(directory), str.view(stem), "-rotated", str.view(extension))
+            save_image(state, rotated, str.view(target), str.view(extension))
+          },
+          none => { model.set_message(state, "rotate failed") },
+        }
+      } else if str.eq(code, "img-png") {
+        let target: string = suffixed(str.view(directory), str.view(stem), "-converted", ".png")
+        save_image(state, picture, str.view(target), ".png")
+      } else if str.eq(code, "img-jpeg") {
+        let target: string = suffixed(str.view(directory), str.view(stem), "-converted", ".jpg")
+        save_image(state, picture, str.view(target), ".jpg")
+      } else if str.eq(code, "img-gray") {
+        match images.grayscale(picture) {
+          some(result) => {
+            var gray: images.Image = result
+            let target: string = suffixed(str.view(directory), str.view(stem), "-gray", str.view(extension))
+            save_image(state, gray, str.view(target), str.view(extension))
+          },
+          none => { model.set_message(state, "grayscale failed") },
+        }
+      }
+    },
+    none => { model.set_message(state, "cannot load image") },
+  }
+  model.refresh(state)
+  ()
+}
+
+fn rotate_pdf(state: ref<model.State>, source: str, code: str) -> unit effects {alloc, fs.meta, fs.read, fs.write} {
+  let directory: string = string.copy(str.view(path.dirname(source)))
+  let stem: string = string.copy(str.view(path.stem(source)))
+  let target: string = suffixed(str.view(directory), str.view(stem), "-rotated", ".pdf")
+  var degrees: i64 = 90
+  if str.eq(code, "pdf-rotate-ccw") { degrees = -90 }
+  match pdf.rotate_file(source, str.view(target), degrees) {
+    ok(_) => { model.set_message(state, "pdf rotated") },
+    err(error) => { model.set_message(state, str.view(pdf.message(error))) },
+  }
+  model.refresh(state)
+  ()
+}
+
+fn split_pdf(state: ref<model.State>, source: str) -> unit effects {alloc, fs.meta, fs.read, fs.write} {
+  let directory: string = string.copy(str.view(path.dirname(source)))
+  let stem: string = string.copy(str.view(path.stem(source)))
+  let folder_name: string = text.concat(str.view(stem), "-pages")
+  let folder: string = path.join(str.view(directory), str.view(folder_name))
+  match fsops.make_directory(str.view(directory), str.view(folder_name)) {
+    ok(_) => {},
+    err(_) => {},
+  }
+  match pdf.split_file(source, str.view(folder), str.view(stem)) {
+    ok(count) => {
+      var message: string = string.copy("split into ")
+      let wide: i64 = cast.wrap(count)
+      let digits: string = string.from_int(wide)
+      string.append(message, str.view(digits))
+      string.append(message, " pages")
+      model.set_message(state, str.view(message))
+    },
+    err(error) => { model.set_message(state, str.view(pdf.message(error))) },
+  }
+  model.refresh(state)
+  ()
+}
+
+fn merge_pdf(state: ref<model.State>) -> unit effects {alloc, fs.meta, fs.read, fs.write} {
+  var entries: array<fsops.Entry> = model.pane_visible_entries(state, state.focus)
+  var inputs: array<string> = array.new()
+  var i: u64 = 0
+  loop {
+    if i >= array.len(entries) { break }
+    let entry: ref<fsops.Entry> = array.borrow(entries, i)
+    if is_pdf(entry) { array.push(inputs, string.copy(entry.path)) }
+    i = i + 1
+  }
+  if array.len(inputs) < 2 {
+    model.set_message(state, "need two or more PDFs")
+    return ()
+  }
+  let directory: string = model.focused_dir(state)
+  let target: string = path.join(str.view(directory), "merged.pdf")
+  match pdf.merge_files(inputs, str.view(target)) {
+    ok(_) => { model.set_message(state, "pdfs merged") },
+    err(error) => { model.set_message(state, str.view(pdf.message(error))) },
+  }
+  model.refresh(state)
+  ()
+}
+
+fn run_action(state: ref<model.State>, code: str, pending: ref<array<transfer.Plan>>) -> unit effects {alloc, env, fs.meta, fs.read, fs.write, process} {
+  if str.eq(code, "pdf-merge") {
+    merge_pdf(state)
+    return ()
+  }
+  if str.eq(code, "new-folder") {
+    match fsops.make_directory(str.view(model.focused_dir(state)), "New Folder") {
+      ok(_) => { model.set_message(state, "folder created") },
+      err(reason) => { model.set_message(state, str.view(reason)) },
+    }
+    model.refresh(state)
+    return ()
+  }
+  if str.eq(code, "new-file") {
+    let directory: string = model.focused_dir(state)
+    let target: string = fsops.unique_path(str.view(directory), "New File.txt")
+    match files.write_text(str.view(target), "") {
+      ok(_) => { model.set_message(state, "file created") },
+      err(_) => { model.set_message(state, "cannot create file") },
+    }
+    model.refresh(state)
+    return ()
+  }
+  if str.eq(code, "paste") {
+    if model.clipboard_count(state) != 0 {
+      let directory: string = model.focused_dir(state)
+      let cut: bool = state.clip_cut
+      let sources: array<string> = clipboard_copy(state)
+      enqueue_transfer(state, str.view(directory), cut, sources, pending)
+      let old: array<string> = ref.swap(struct.borrow(state, field=clipboard), array.new())
+      struct.set(state, false, field=clip_cut)
+    } else {
+      model.set_message(state, "clipboard is empty")
+    }
+    return ()
+  }
+  match model.pane_selected_entry(state, state.focus) {
+    some(value) => {
+      var entry: fsops.Entry = value
+      let source: string = fsops.path_of(entry)
+      if str.eq(code, "open") {
+        open_in_pane(state, state.focus)
+      } else if str.eq(code, "open-tab") {
+        if fsops.is_dir_of(entry) {
+          model.pane_new_tab(state, state.focus)
+          model.pane_navigate(state, state.focus, str.view(source))
+        } else {
+          model.set_message(state, "select a folder first")
+        }
+      } else if str.eq(code, "open-terminal") {
+        open_terminal(state)
+      } else if str.eq(code, "cut") {
+        model.copy_selection(state, true)
+      } else if str.eq(code, "copy") {
+        model.copy_selection(state, false)
+      } else if str.eq(code, "rename") {
+        open_dialog(state, model.dialog_rename())
+      } else if str.eq(code, "trash") {
+        open_dialog(state, model.dialog_confirm_delete())
+      } else if str.eq(code, "delete") {
+        var entries: array<fsops.Entry> = model.selected_entries(state)
+        var deleted: u64 = 0
+        var d: u64 = 0
+        loop {
+          if d >= array.len(entries) { break }
+          match fsops.remove_tree(array.borrow(entries, d).path) {
+            ok(_) => { deleted = deleted + 1 },
+            err(reason) => { model.set_message(state, str.view(reason)) },
+          }
+          d = d + 1
+        }
+        var note: string = string.copy("deleted ")
+        string.append(note, str.view(string.from_int(deleted)))
+        string.append(note, " item(s)")
+        model.set_message(state, str.view(note))
+        model.refresh(state)
+      } else if str.eq(code, "properties") {
+        open_dialog(state, model.dialog_properties())
+      } else if str.eq(code, "permissions") {
+        open_dialog(state, model.dialog_permissions())
+      } else if str.eq(code, "checksum") {
+        do_checksum(state)
+      } else if str.eq(code, "folder-size") {
+        let size: u64 = fsops.folder_size(str.view(source))
+        var note: string = string.copy("size ")
+        string.append(note, str.view(fmt.human_size(size)))
+        model.set_message(state, str.view(note))
+      } else if str.eq(code, "compress") {
+        open_dialog(state, model.dialog_archive())
+      } else if str.eq(code, "extract-here") {
+        let directory: string = model.focused_dir(state)
+        match archive.extract(str.view(source), str.view(directory), str.view(log_path("airpolo-7z.log"))) {
+          ok(_) => { model.set_message(state, "extracted") },
+          err(reason) => { model.set_message(state, str.view(reason)) },
+        }
+        model.refresh(state)
+      } else if str.eq(code, "extract-to") {
+        open_dialog(state, model.dialog_extract())
+      } else if str.eq(code, "browse") {
+        open_dialog(state, model.dialog_browse())
+      } else if str.eq(code, "copy-across") {
+        var sources: array<string> = array.new()
+        var entries: array<fsops.Entry> = model.selected_entries(state)
+        var s: u64 = 0
+        loop {
+          if s >= array.len(entries) { break }
+          array.push(sources, string.copy(array.borrow(entries, s).path))
+          s = s + 1
+        }
+        enqueue_transfer(state, str.view(model.opposite_dir(state)), false, sources, pending)
+      } else if str.eq(code, "move-across") {
+        var sources: array<string> = array.new()
+        var entries: array<fsops.Entry> = model.selected_entries(state)
+        var s: u64 = 0
+        loop {
+          if s >= array.len(entries) { break }
+          array.push(sources, string.copy(array.borrow(entries, s).path))
+          s = s + 1
+        }
+        enqueue_transfer(state, str.view(model.opposite_dir(state)), true, sources, pending)
+      } else if str.eq(code, "pdf-rotate-cw") or str.eq(code, "pdf-rotate-ccw") {
+        rotate_pdf(state, str.view(source), code)
+      } else if str.eq(code, "pdf-split") {
+        split_pdf(state, str.view(source))
+      } else if str.eq(code, "pdf-uncompress") {
+        let dir: string = string.copy(str.view(path.dirname(source)))
+        let stem: string = string.copy(str.view(path.stem(source)))
+        let target: string = suffixed(str.view(dir), str.view(stem), "-plain", ".pdf")
+        match pdf.uncompress_file(source, str.view(target)) {
+          ok(_) => { model.set_message(state, "uncompressed") },
+          err(error) => { model.set_message(state, str.view(pdf.message(error))) },
+        }
+        model.refresh(state)
+      } else if str.eq(code, "pdf-remove-color") {
+        let dir: string = string.copy(str.view(path.dirname(source)))
+        let stem: string = string.copy(str.view(path.stem(source)))
+        let target: string = suffixed(str.view(dir), str.view(stem), "-gray", ".pdf")
+        match pdf.remove_color_file(source, str.view(target)) {
+          ok(_) => { model.set_message(state, "colours removed") },
+          err(error) => { model.set_message(state, str.view(pdf.message(error))) },
+        }
+        model.refresh(state)
+      } else if str.eq(code, "pdf-optimize") {
+        let dir: string = string.copy(str.view(path.dirname(source)))
+        let stem: string = string.copy(str.view(path.stem(source)))
+        let target: string = suffixed(str.view(dir), str.view(stem), "-optimized", ".pdf")
+        match pdf.optimize_file(source, str.view(target)) {
+          ok(_) => { model.set_message(state, "optimized") },
+          err(error) => { model.set_message(state, str.view(pdf.message(error))) },
+        }
+        model.refresh(state)
+      } else if str.eq(code, "pdf-password-add") or str.eq(code, "pdf-password-remove") {
+        struct.set(state, str.eq(code, "pdf-password-add"), field=pdf_password_add)
+        let _p: string = struct.replace(state, source, field=dialog_path)
+        if str.eq(code, "pdf-password-add") {
+          let _t: string = struct.replace(state, string.copy("Add password"), field=dialog_title)
+        } else {
+          let _t: string = struct.replace(state, string.copy("Remove password"), field=dialog_title)
+        }
+        let _x: string = struct.replace(state, string.copy("Password:"), field=dialog_text)
+        let _v: string = struct.replace(state, string.new(), field=dialog_value)
+        struct.set(state, model.dialog_pdf_password(), field=dialog)
+      } else if str.eq(code, "pdf-validate") {
+        match pdf.validate_file(source) {
+          ok(report) => {
+            var value: pdf.Validation = report
+            var note: string = string.copy("pages ")
+            let p: i64 = cast.wrap(value.page_count)
+            string.append(note, str.view(string.from_int(p)))
+            string.append(note, ", missing refs ")
+            let m: i64 = cast.wrap(value.missing_references)
+            string.append(note, str.view(string.from_int(m)))
+            if value.has_root { string.append(note, ", catalog ok") } else { string.append(note, ", no catalog") }
+            model.set_message(state, str.view(note))
+          },
+          err(error) => { model.set_message(state, str.view(pdf.message(error))) },
+        }
+      } else if str.eq(code, "img-rotate-cw") or str.eq(code, "img-rotate-ccw") or str.eq(code, "img-png") or str.eq(code, "img-jpeg") or str.eq(code, "img-gray") {
+        transform_image(state, str.view(source), code)
+      } else {
+        model.set_message(state, "unknown action")
+      }
+    },
+    none => { model.set_message(state, "select an item first") },
+  }
+  ()
+}
+
+fn handle_actions(ui: ref<w.Ui>, state: ref<model.State>, pending: ref<array<transfer.Plan>>) -> bool effects {alloc, env, fs.meta, fs.read, fs.write, process, time} {
+  var changed: bool = false
+  let count: u64 = w.action_count(ui)
+  var i: u64 = 0
+  loop {
+    if i >= count { break }
+    let entry: w.Action = w.action_at(ui, i)
+    let kind: u8 = entry.kind
+    let key: u64 = entry.key
+    if kind == w.action_changed() and key == page.key_filter() {
+      let typed: string = w.text_of(ui, w.find(ui, page.key_filter()))
+      model.set_filter(state, str.view(typed))
+      changed = true
+    }
+    if kind == w.action_activated() {
+      if key == page.key_back() { model.pane_back(state, state.focus)
+        changed = true }
+      if key == page.key_forward() { model.pane_forward(state, state.focus)
+        changed = true }
+      if key == page.key_up() { model.pane_up(state, state.focus)
+        changed = true }
+      if key == page.key_home() { model.pane_home(state, state.focus)
+        changed = true }
+      if key == page.key_open() { open_selected(state)
+        changed = true }
+      if key == page.key_new() {
+        match fsops.make_directory(str.view(model.focused_dir(state)), "New Folder") {
+          ok(_) => { model.set_message(state, "folder created") },
+          err(reason) => { model.set_message(state, str.view(reason)) },
+        }
+        model.refresh(state)
+        changed = true
+      }
+      if key == page.key_delete() { open_dialog(state, model.dialog_confirm_delete())
+        changed = true }
+      if key == page.key_copy() { model.copy_selection(state, false)
+        changed = true }
+      if key == page.key_paste() {
+        if model.clipboard_count(state) != 0 {
+          let dir: string = model.focused_dir(state)
+          let cut: bool = state.clip_cut
+          let sources: array<string> = clipboard_copy(state)
+          enqueue_transfer(state, str.view(dir), cut, sources, pending)
+          let old: array<string> = ref.swap(struct.borrow(state, field=clipboard), array.new())
+          struct.set(state, false, field=clip_cut)
+        }
+        changed = true
+      }
+      if key == page.key_cancel_job() { model.request_stop(state)
+        changed = true }
+      if key == page.key_search() { let _n: u64 = model.search_here(state)
+        changed = true }
+      if key == page.key_browse() { open_dialog(state, model.dialog_browse())
+        changed = true }
+      if key == page.key_actions() { open_actions(state)
+        changed = true }
+      if key == page.key_permissions() { open_dialog(state, model.dialog_permissions())
+        changed = true }
+      if key == page.key_settings() { model.open_settings(state)
+        changed = true }
+      if key >= page.key_source_theme_base() and key < page.key_source_theme_base() + app_theme.source_theme_count() {
+        model.set_settings_theme(state, key - page.key_source_theme_base())
+        model.preview_settings(state)
+        apply_theme(ui, state)
+      }
+      if key >= page.key_theme_background_base() and key < page.key_theme_background_base() + 5 {
+        model.set_settings_background(state, key - page.key_theme_background_base())
+        model.preview_settings(state)
+        apply_theme(ui, state)
+      }
+      if key >= page.key_theme_accent_base() and key < page.key_theme_accent_base() + 6 {
+        model.set_settings_accent(state, key - page.key_theme_accent_base())
+        model.preview_settings(state)
+        apply_theme(ui, state)
+      }
+      if key == page.key_theme_revert() {
+        model.revert_settings(state)
+        apply_theme(ui, state)
+      }
+      if key == page.key_toggle_view() {
+        model.set_view(state, if state.view_mode == 1 { 0 } else { 1 })
+        model.save(state)
+        changed = true
+      }
+      if key >= page.key_icon_base() and key < page.key_icon_base() + 4096 {
+        model.set_selected(state, key - page.key_icon_base())
+        open_selected(state)
+        changed = true
+      }
+      if key == page.key_checksum() { do_checksum(state)
+        changed = true }
+      if key == page.key_properties() { open_dialog(state, model.dialog_properties())
+        changed = true }
+      if key == page.key_rename() { open_dialog(state, model.dialog_rename())
+        changed = true }
+      if key == page.key_archive() { open_dialog(state, model.dialog_archive())
+        changed = true }
+      if key == page.key_extract() { open_dialog(state, model.dialog_extract())
+        changed = true }
+      if key == page.key_hidden() { model.toggle_hidden(state)
+        changed = true }
+      if key == page.key_sort_name() { model.set_sort(state, fsops.sort_name())
+        changed = true }
+      if key == page.key_sort_size() { model.set_sort(state, fsops.sort_size())
+        changed = true }
+      if key == page.key_sort_time() { model.set_sort(state, fsops.sort_mtime())
+        changed = true }
+      if key >= page.key_layout_base() and key < page.key_layout_base() + 4 {
+        model.set_layout(state, key - page.key_layout_base())
+        if model.layout_mode(state) == 3 { model.open_quad_tabs(state) }
+        model.save(state)
+        changed = true
+      }
+      if key == page.key_dual() { model.cycle_layout(state)
+        if model.layout_mode(state) == 3 { model.open_quad_tabs(state) }
+        model.save(state)
+        changed = true }
+      if key == page.key_focus() { model.toggle_focus(state)
+        changed = true }
+      if key == page.key_copy_other() {
+        var entries: array<fsops.Entry> = model.selected_entries(state)
+        if array.len(entries) == 0 { model.set_message(state, "select an item first") }
+        else {
+          var sources: array<string> = array.new()
+          var s: u64 = 0
+          loop {
+            if s >= array.len(entries) { break }
+            array.push(sources, string.copy(array.borrow(entries, s).path))
+            s = s + 1
+          }
+          let dest: string = model.opposite_dir(state)
+          enqueue_transfer(state, str.view(dest), false, sources, pending)
+          model.refresh_other(state)
+        }
+        changed = true
+      }
+      if key == page.key_bookmark() { model.add_bookmark(state)
+        model.save(state)
+        changed = true }
+      if key == page.key_terminal() { open_terminal(state)
+        changed = true }
+      if key == page.key_new_tab() { model.pane_new_tab(state, state.focus)
+        changed = true }
+      if key == page.key_close_tab() { model.pane_close_tab(state, state.focus)
+        changed = true }
+      if key >= page.key_pane_tab_new_base() and key < page.key_pane_tab_new_base() + 4 {
+        let pane: u64 = key - page.key_pane_tab_new_base()
+        model.focus_pane(state, pane)
+        model.pane_new_tab(state, pane)
+        changed = true
+      }
+      if key >= page.key_pane_tab_close_base() and key < page.key_pane_tab_close_base() + 4 {
+        let pane: u64 = key - page.key_pane_tab_close_base()
+        model.focus_pane(state, pane)
+        model.pane_close_tab(state, pane)
+        changed = true
+      }
+      if key >= page.key_pane_tab_base() and key < page.key_pane_tab_base() + 512 {
+        let offset: u64 = key - page.key_pane_tab_base()
+        let pane: u64 = offset / 128
+        let tab: u64 = offset % 128
+        if pane < model.pane_count(state) and tab < model.pane_tab_count(state, pane) {
+          model.focus_pane(state, pane)
+          model.pane_switch_tab(state, pane, tab)
+          changed = true
+        }
+      }
+      if key == page.key_files_other() { model.toggle_focus(state)
+        changed = true }
+      if key >= page.key_bookmark_base() and key < page.key_bookmark_base() + 64 {
+        match model.bookmark_at(state, key - page.key_bookmark_base()) {
+          some(target) => { model.navigate(state, str.view(target))
+            changed = true },
+          none => {},
+        }
+      }
+      if key >= page.key_mount_base() and key < page.key_mount_base() + 64 {
+        match model.mount_at(state, key - page.key_mount_base()) {
+          some(mount_value) => {
+            var item: mounts.Mount = mount_value
+            model.navigate(state, str.view(mounts.point_of(item)))
+            changed = true
+          },
+          none => {},
+        }
+      }
+      if key >= page.key_place_base() and key < page.key_place_base() + 32 {
+        let index: u64 = key - page.key_place_base()
+        var places: array<string> = page_places()
+        if index < array.len(places) {
+          model.navigate(state, str.view(array.borrow(places, index)))
+          changed = true
+        }
+      }
+      if key == page.key_dialog_ok() {
+        if state.dialog == model.dialog_settings() {
+          model.apply_settings(state)
+          model.save(state)
+          apply_theme(ui, state)
+        } else {
+          let value: string = w.text_of(ui, w.find(ui, page.key_dialog_value()))
+          dialog_ok(state, str.view(value), pending)
+        }
+        changed = true
+      }
+      if key == page.key_dialog_cancel() { close_dialog(state)
+        apply_theme(ui, state)
+        changed = true }
+    }
+    if kind == w.action_resized() { changed = true }
+    if kind == w.action_drop() {
+      var target_pane: u64 = state.focus
+      if key == page.key_files() { target_pane = 0 }
+      if key == page.key_files_other() { target_pane = 1 }
+      if key == page.key_pane2() { target_pane = 2 }
+      if key == page.key_pane3() { target_pane = 3 }
+      var dragged: array<fsops.Entry> = model.pane_selected_entries(state, state.focus)
+      if array.len(dragged) != 0 {
+          var destination: string = model.pane_dir(state, target_pane)
+          match model.pane_entry_at(state, target_pane, entry.value) {
+            some(drop_value) => {
+              var drop_entry: fsops.Entry = drop_value
+              if fsops.is_dir_of(drop_entry) { destination = fsops.path_of(drop_entry) }
+            },
+            none => {},
+          }
+          var sources: array<string> = array.new()
+          var s: u64 = 0
+          loop {
+            if s >= array.len(dragged) { break }
+            array.push(sources, string.copy(array.borrow(dragged, s).path))
+            s = s + 1
+          }
+          enqueue_transfer(state, str.view(destination), false, sources, pending)
+          model.refresh_pane(state, target_pane)
+          model.set_message(state, "copied here")
+          changed = true
+      }
+    }
+    if kind == w.action_context() {
+      if key == page.key_files() { model.focus_pane(state, 0)
+        model.set_pane_selected(state, 0, entry.value)
+        open_actions(state)
+        changed = true }
+      if key == page.key_files_other() { model.focus_pane(state, 1)
+        model.set_pane_selected(state, 1, entry.value)
+        open_actions(state)
+        changed = true }
+      if key == page.key_pane2() { model.focus_pane(state, 2)
+        model.set_pane_selected(state, 2, entry.value)
+        open_actions(state)
+        changed = true }
+      if key == page.key_pane3() { model.focus_pane(state, 3)
+        model.set_pane_selected(state, 3, entry.value)
+        open_actions(state)
+        changed = true }
+    }
+    if kind == w.action_selected() {
+      var rows: array<u64> = w.selected_rows(ui, entry.index)
+      if key == page.key_files() { model.focus_pane(state, 0)
+        model.set_pane_selection(state, 0, rows, entry.value)
+        changed = true }
+      if key == page.key_files_other() { model.focus_pane(state, 1)
+        model.set_pane_selection(state, 1, rows, entry.value)
+        changed = true }
+      if key == page.key_pane2() { model.focus_pane(state, 2)
+        model.set_pane_selection(state, 2, rows, entry.value)
+        changed = true }
+      if key == page.key_pane3() { model.focus_pane(state, 3)
+        model.set_pane_selection(state, 3, rows, entry.value)
+        changed = true }
+    }
+    if kind == w.action_activated() {
+      if key == page.key_files() { model.focus_pane(state, 0)
+        model.set_selected(state, entry.value)
+        open_in_pane(state, 0)
+        changed = true }
+      if key == page.key_files_other() { model.focus_pane(state, 1)
+        model.set_pane_selected(state, 1, entry.value)
+        open_in_pane(state, 1)
+        changed = true }
+      if key == page.key_pane2() { model.focus_pane(state, 2)
+        model.set_pane_selected(state, 2, entry.value)
+        open_in_pane(state, 2)
+        changed = true }
+      if key == page.key_pane3() { model.focus_pane(state, 3)
+        model.set_pane_selected(state, 3, entry.value)
+        open_in_pane(state, 3)
+        changed = true }
+    }
+    i = i + 1
+  }
+  w.clear_actions(ui)
+  changed
+}
+
+// Polo-compatible focused-pane shortcuts. Editors keep first refusal through wants_key,
+// so file operations never steal Ctrl+C/X/V from the filter or a dialog field.
+fn handle_hotkey(ui: ref<w.Ui>, state: ref<model.State>, press: w.KeyPress,
+                 pending: ref<array<transfer.Plan>>) -> bool effects {alloc, env, fs.meta, fs.read, fs.write, process} {
+  if state.dialog != model.dialog_none() or w.wants_key(ui, press) { return false }
+  let code: u32 = w.letter(press.code)
+  if press.control and code == 116 {
+    model.pane_new_tab(state, state.focus)
+    return true
+  }
+  if press.control and code == 119 {
+    model.pane_close_tab(state, state.focus)
+    return true
+  }
+  if press.control and code == w.key_c() {
+    model.copy_selection(state, false)
+    return true
+  }
+  if press.control and code == w.key_x() {
+    model.copy_selection(state, true)
+    return true
+  }
+  if press.control and code == w.key_v() {
+    if model.clipboard_count(state) != 0 {
+      let directory: string = model.focused_dir(state)
+      let cut: bool = state.clip_cut
+      let sources: array<string> = clipboard_copy(state)
+      enqueue_transfer(state, str.view(directory), cut, sources, pending)
+      let _old: array<string> = ref.swap(struct.borrow(state, field=clipboard), array.new())
+      struct.set(state, false, field=clip_cut)
+    } else {
+      model.set_message(state, "clipboard is empty")
+    }
+    return true
+  }
+  if press.control and code == 104 {
+    model.toggle_hidden(state)
+    model.save(state)
+    return true
+  }
+  if press.control and press.shift and code == 110 {
+    match fsops.make_directory(str.view(model.focused_dir(state)), "New Folder") {
+      ok(_) => { model.set_message(state, "folder created") },
+      err(reason) => { model.set_message(state, str.view(reason)) },
+    }
+    model.refresh_pane(state, state.focus)
+    return true
+  }
+  if press.code == 65474 {
+    model.refresh_pane(state, state.focus)
+    return true
+  }
+  if press.code == 65473 {
+    open_terminal(state)
+    return true
+  }
+  if press.code == w.key_delete() {
+    if press.shift { open_dialog(state, model.dialog_confirm_permanent_delete()) }
+    else { open_dialog(state, model.dialog_confirm_delete()) }
+    return true
+  }
+  false
+}
+
+// The places list the view draws, so a clicked place maps back to a path.
+pub fn page_places() -> array<string> effects {alloc, env} {
+  var out: array<string> = array.new()
+  match env.get("HOME") {
+    some(home) => {
+      array.push(out, string.copy(str.view(home)))
+      array.push(out, text.concat(str.view(home), "/Downloads"))
+      array.push(out, text.concat(str.view(home), "/Documents"))
+      array.push(out, text.concat(str.view(home), "/Pictures"))
+      array.push(out, text.concat(str.view(home), "/Music"))
+      array.push(out, text.concat(str.view(home), "/Videos"))
+    },
+    none => {},
+  }
+  array.push(out, string.copy("/"))
+  array.push(out, string.copy("/tmp"))
+  out
+}
+
+fn write_frame(app: ref<shell.Shell>, ui: ref<w.Ui>, directory: str, name: str) -> bool effects {alloc, fs.write, fs.meta, ui} {
+  repaint(app, ui)
+  var target: string = string.copy(directory)
+  string.append(target, "/")
+  string.append(target, name)
+  string.append(target, ".ppm")
+  match shell.write_frame(app, str.view(target)) { ok(_) => true, err(_) => false }
+}
+
+fn scripted(ui: ref<w.Ui>, state: ref<model.State>, app: ref<shell.Shell>, directory: str) -> i32 effects {alloc, env, fs.write, fs.meta, fs.read, process, ui} {
+  struct.set(state, false, field=dual)
+  struct.set(state, 0, field=view_mode)
+  relayout(ui, state)
+  let _f1: bool = write_frame(app, ui, directory, "01-browser")
+  model.set_view(state, 1)
+  relayout(ui, state)
+  let _fi: bool = write_frame(app, ui, directory, "02-icons")
+  model.set_view(state, 0)
+  struct.set(state, true, field=dual)
+  relayout(ui, state)
+  let _fd: bool = write_frame(app, ui, directory, "03-dual")
+  struct.set(state, false, field=dual)
+  struct.set(state, 2, field=layout)
+  struct.set(state, true, field=dual)
+  relayout(ui, state)
+  let _fh: bool = write_frame(app, ui, directory, "05-horizontal")
+  struct.set(state, 3, field=layout)
+  struct.set(state, true, field=dual)
+  model.open_quad_tabs(state)
+  relayout(ui, state)
+  let _fq: bool = write_frame(app, ui, directory, "06-quad")
+  struct.set(state, 0, field=layout)
+  struct.set(state, false, field=dual)
+  struct.set(state, false, field=dual)
+  struct.set(state, model.dialog_properties(), field=dialog)
+  let _t: string = struct.replace(state, string.copy("Properties"), field=dialog_title)
+  let _x: string = struct.replace(state, string.copy("Name: example.txt\nType: document\nSize: 12 KiB (12288 bytes)\nLocation: /tmp\nPath: /tmp/example.txt\nModified: 2026-09-21 19:00:00\nPermissions: 0644  -rw-r--r--\nOwner: 1000\nGroup: 1000"), field=dialog_text)
+  relayout(ui, state)
+  let _f2: bool = write_frame(app, ui, directory, "02-properties")
+  close_dialog(state)
+  open_actions(state)
+  relayout(ui, state)
+  let _fa: bool = write_frame(app, ui, directory, "04-actions")
+  close_dialog(state)
+  relayout(ui, state)
+  let _f3: bool = write_frame(app, ui, directory, "03-back")
+  model.open_settings(state)
+  model.set_settings_theme(state, 2)
+  model.preview_settings(state)
+  apply_theme(ui, state)
+  relayout(ui, state)
+  let _fs: bool = write_frame(app, ui, directory, "07-settings-chooser")
+  model.apply_settings(state)
+  apply_theme(ui, state)
+  relayout(ui, state)
+  let _ft: bool = write_frame(app, ui, directory, "08-themed-browser")
+  0
+}
+
+fn interactive(ui: ref<w.Ui>, state: ref<model.State>, app: ref<shell.Shell>) -> i32 effects {alloc, env, fs.meta, fs.read, fs.write, io.write, process, thread, time, ui} {
+  match shell.open_window(app, "AirPolo") {
+    ok(_) => {},
+    err(problem) => {
+      io.ewrite(problem)
+      io.ewrite("\n")
+      return 1
+    },
+  }
+  relayout(ui, state)
+  task.scope {
+    var pending: array<transfer.Plan> = array.new()
+    var handles: array<task<transfer.Outcome>> = array.new()
+    var watchers: array<watch.Watcher> = array.new()
+    var pane: u64 = 0
+    loop {
+      if pane >= 4 { break }
+      array.push(watchers, watch.track("/"))
+      pane = pane + 1
+    }
+    var last_watch: u64 = 0
+    loop {
+      if w.dirty(ui) { repaint(app, ui) }
+      // shell.wait handles close requests, window resizes (which also resize the canvas)
+      // and bound keys; unclaimed input comes back as an Event to dispatch into the tree.
+      var closing: bool = false
+      var escape: bool = false
+      var consumed: bool = false
+      match shell.wait(app, ui, 30) {
+        Closing => { closing = true },
+        Event(input) => {
+          match input {
+            Tick => {},
+            PointerDown(_) => {},
+            PointerUp(_) => {},
+            PointerMove(_) => {},
+            Scroll(_) => {},
+            Key(press) => {
+              if press.code == w.key_escape() and state.dialog != 0 {
+                escape = true
+                consumed = true
+              } else {
+                consumed = handle_hotkey(ui, state, press, pending)
+              }
+            },
+            Text(_) => {},
+            Resize(_) => {},
+            Progress(_) => {},
+          }
+          if not consumed { let _dispatched: u64 = shell.dispatch(app, ui, input) }
+        },
+        Command(_) => {},
+        Handled => {},
+        Idle => {},
+      }
+      if closing { break }
+      var changed: bool = handle_actions(ui, state, pending)
+      if escape { close_dialog(state)
+        apply_theme(ui, state)
+        changed = true }
+      loop {
+        match array.pop(pending) {
+          some(plan) => { array.push(handles, task.spawn(plan, fn=transfer.run)) },
+          none => { break },
+        }
+      }
+      model.poll_job(state)
+      loop {
+        match tasks.join_next<transfer.Outcome>(handles, 0) {
+          some(value) => {
+            var outcome: transfer.Outcome = value
+            var note: string = string.copy("moved ")
+            string.append(note, str.view(string.from_int(outcome.copied)))
+            string.append(note, " items")
+            if outcome.failed != 0 {
+              string.append(note, ", ")
+              string.append(note, str.view(string.from_int(outcome.failed)))
+              string.append(note, " failed")
+            }
+            model.finish_job(state, str.view(note))
+            model.refresh(state)
+            model.refresh_other(state)
+            changed = true
+          },
+          none => { break },
+        }
+      }
+      // Watch every visible pane's directory and refresh when it changes externally.
+      let now: u64 = time.monotonic_ns()
+      if now - last_watch >= 300000000 {
+        last_watch = now
+        var p: u64 = 0
+        loop {
+          if p >= model.pane_count(state) { break }
+          let dir: string = model.pane_dir(state, p)
+          watch.retarget(array.borrow(watchers, p), str.view(dir))
+          if watch.changed(array.borrow(watchers, p)) {
+            watch.mark(array.borrow(watchers, p))
+            model.refresh_pane(state, p)
+            changed = true
+          }
+          p = p + 1
+        }
+      }
+      if changed { relayout(ui, state) }
+    }
+    let _reclaimed: u64 = tasks.reclaim<transfer.Outcome>(handles)
+  }
+  0
+}
+
+fn print_entries(dir: str, show_hidden: bool) -> i32 effects {alloc, fs.meta, io.write} {
+  var entries: array<fsops.Entry> = fsops.list_entries(dir, show_hidden, fsops.sort_name())
+  var i: u64 = 0
+  loop {
+    if i >= array.len(entries) { break }
+    let entry: ref<fsops.Entry> = array.borrow(entries, i)
+    io.write(str.view(entry.kind))
+    io.write("\t")
+    io.write(str.view(entry.name))
+    io.write("\t")
+    io.write(str.view(string.from_int(entry.size)))
+    io.write("\n")
+    i = i + 1
+  }
+  0
+}
+
+// --- Headless action verification -----------------------------------------
+
+fn select_path(state: ref<model.State>, target: str) -> unit effects {alloc, fs.meta} {
+  model.set_filter(state, str.view(path.basename(target)))
+  model.set_selected(state, 0)
+  ()
+}
+
+fn exists(target: str) -> bool effects {fs.meta} {
+  match files.exists(target) { ok(value) => value, err(_) => false }
+}
+
+fn act(state: ref<model.State>, code: str, target: str, pending: ref<array<transfer.Plan>>) -> unit effects {alloc, env, fs.meta, fs.read, fs.write, process, time} {
+  select_path(state, target)
+  run_action(state, code, pending)
+  ()
+}
+
+fn report(name: str, ok: bool) -> bool effects {alloc, io.write} {
+  if ok {
+    io.write("ok   ")
+    io.write(name)
+    io.write("\n")
+    true
+  } else {
+    io.write("FAIL ")
+    io.write(name)
+    io.write("\n")
+    false
+  }
+}
+
+fn make_pdf(path_value: str, pages: u64) -> bool effects {alloc, fs.write} {
+  var doc: pdf.PdfDoc = pdf.document()
+  let font: bytes = pdf.standard_font_object("Helvetica")
+  let font_obj: u64 = pdf.add_object(doc, bytes.view(font))
+  var i: u64 = 0
+  loop {
+    if i >= pages { break }
+    var page: pdf.Page = pdf.new_page(120.0, 120.0)
+    let name: string = pdf.page_add_font(page, font_obj)
+    let content: ref<pdf.Content> = struct.borrow(page, field=data)
+    pdf.begin_text(content)
+    pdf.set_font(content, str.view(name), 10.0)
+    pdf.text_pos(content, 10.0, 60.0)
+    pdf.show_text(content, "x")
+    pdf.end_text(content)
+    match pdf.finish_page(page, doc, false) {
+      ok(_) => {},
+      err(_) => { return false },
+    }
+    i = i + 1
+  }
+  match pdf.save(doc, path_value) { ok(_) => true, err(_) => false }
+}
+
+// Exercise every non-dialog Actions entry on a private fixture tree and report which pass.
+fn action_check(directory: str) -> i32 effects {alloc, env, fs.meta, fs.read, fs.write, io.write, process, time} {
+  let work: string = string.copy(directory)
+  let _m: result<unit, fs.error> = files.mkdirs(str.view(work))
+  let one: string = path.join(str.view(work), "one.txt")
+  let _w1: result<unit, fs.error> = files.write_text(str.view(one), "one")
+  let sub: string = path.join(str.view(work), "sub")
+  let _m2: result<unit, fs.error> = files.mkdirs(str.view(sub))
+  let _w3: result<unit, fs.error> = files.write_text(str.view(path.join(str.view(sub), "three.txt")), "three")
+  let throwaway: string = path.join(str.view(work), "throw.txt")
+  let _wt: result<unit, fs.error> = files.write_text(str.view(throwaway), "x")
+  let png: string = path.join(str.view(work), "seed.png")
+  var made_png: bool = false
+  match draw.surface(8, 8) {
+    some(surface) => {
+      var picture: draw.Surface = surface
+      let encoded: bytes = image.encode_png(picture)
+      match files.write_bytes(str.view(png), bytes.view(encoded)) {
+        ok(_) => { made_png = true },
+        err(_) => {},
+      }
+    },
+    none => {},
+  }
+
+  let pdf_a: string = path.join(str.view(work), "seed.pdf")
+  let pdf_b: string = path.join(str.view(work), "seed2.pdf")
+  let made_pdf: bool = make_pdf(str.view(pdf_a), 1) and make_pdf(str.view(pdf_b), 1)
+  let bundle: string = path.join(str.view(work), "bundle.zip")
+  var bundle_members: array<string> = array.new()
+  array.push(bundle_members, string.copy(str.view(path.join(str.view(sub), "three.txt"))))
+  let made_zip: bool = match archive.create(str.view(bundle), bundle_members, str.view(path.join(str.view(work), "z.log"))) {
+    ok(_) => true,
+    err(_) => false,
+  }
+
+  let settings_path: string = path.join(str.view(work), "settings.json")
+  var state: model.State = model.start(str.view(work), str.view(settings_path))
+  model.set_scale(state, 1)
+  var pending: array<transfer.Plan> = array.new()
+  var failures: u64 = 0
+
+  // new-folder / new-file
+  act(state, "new-folder", str.view(one), pending)
+  if not report("new-folder", exists(str.view(path.join(str.view(work), "New Folder")))) { failures = failures + 1 }
+  act(state, "new-file", str.view(one), pending)
+  if not report("new-file", exists(str.view(path.join(str.view(work), "New File.txt")))) { failures = failures + 1 }
+
+  // folder-size
+  act(state, "folder-size", str.view(sub), pending)
+  if not report("folder-size", str.starts_with(str.view(state.message), "size ")) { failures = failures + 1 }
+
+  // delete a throwaway file
+  act(state, "delete", str.view(throwaway), pending)
+  if not report("delete", not exists(str.view(throwaway))) { failures = failures + 1 }
+
+  // cut / copy / paste
+  act(state, "cut", str.view(one), pending)
+  if not report("cut", model.clipboard_count(state) == 1) { failures = failures + 1 }
+  act(state, "copy", str.view(one), pending)
+  if not report("copy", model.clipboard_count(state) == 1) { failures = failures + 1 }
+  act(state, "paste", str.view(one), pending)
+  if not report("paste", array.len(pending) == 1 or model.clipboard_count(state) == 1) { failures = failures + 1 }
+  let _drain: array<string> = ref.swap(struct.borrow(state, field=clipboard), array.new())
+
+  // copy/move across
+  var cross: array<transfer.Plan> = array.new()
+  act(state, "copy-across", str.view(one), cross)
+  if not report("copy-across", array.len(cross) == 1) { failures = failures + 1 }
+  var cross2: array<transfer.Plan> = array.new()
+  act(state, "move-across", str.view(one), cross2)
+  if not report("move-across", array.len(cross2) == 1) { failures = failures + 1 }
+
+  // image actions
+  if made_png {
+    act(state, "img-rotate-cw", str.view(png), pending)
+    if not report("img-rotate-cw", exists(str.view(path.join(str.view(work), "seed-rotated.png")))) { failures = failures + 1 }
+    act(state, "img-jpeg", str.view(png), pending)
+    if not report("img-jpeg", exists(str.view(path.join(str.view(work), "seed-converted.jpg")))) { failures = failures + 1 }
+  } else {
+    if not report("img-fixture", false) { failures = failures + 1 }
+  }
+
+  // pdf actions
+  if made_pdf {
+    act(state, "pdf-rotate-cw", str.view(pdf_a), pending)
+    if not report("pdf-rotate-cw", exists(str.view(path.join(str.view(work), "seed-rotated.pdf")))) { failures = failures + 1 }
+    act(state, "pdf-split", str.view(pdf_a), pending)
+    var split_part: string = path.join(str.view(work), "seed-pages")
+    split_part = path.join(str.view(split_part), "seed-1.pdf")
+    if not report("pdf-split", exists(str.view(split_part))) { failures = failures + 1 }
+    act(state, "pdf-remove-color", str.view(pdf_a), pending)
+    if not report("pdf-remove-color", exists(str.view(path.join(str.view(work), "seed-gray.pdf")))) { failures = failures + 1 }
+    act(state, "pdf-optimize", str.view(pdf_a), pending)
+    if not report("pdf-optimize", exists(str.view(path.join(str.view(work), "seed-optimized.pdf")))) { failures = failures + 1 }
+    act(state, "pdf-uncompress", str.view(pdf_a), pending)
+    if not report("pdf-uncompress", exists(str.view(path.join(str.view(work), "seed-plain.pdf")))) { failures = failures + 1 }
+    act(state, "pdf-validate", str.view(pdf_a), pending)
+    if not report("pdf-validate", str.starts_with(str.view(state.message), "pages ")) { failures = failures + 1 }
+    model.set_filter(state, "")
+    var merge_pending: array<transfer.Plan> = array.new()
+    run_action(state, "pdf-merge", merge_pending)
+    if not report("pdf-merge", exists(str.view(path.join(str.view(work), "merged.pdf")))) { failures = failures + 1 }
+  } else {
+    if not report("pdf-fixture", false) { failures = failures + 1 }
+  }
+
+  // archive extract-here (native zip)
+  if made_zip {
+    act(state, "extract-here", str.view(bundle), pending)
+    if not report("extract-here", exists(str.view(path.join(str.view(work), "three.txt")))) { failures = failures + 1 }
+  } else {
+    if not report("zip-fixture", false) { failures = failures + 1 }
+  }
+
+  // Polo batches copy/delete over the complete multi-selection.
+  let batch_a: string = path.join(str.view(work), "batch-alpha.txt")
+  let batch_b: string = path.join(str.view(work), "batch-beta.txt")
+  let _ba: result<unit, fs.error> = files.write_text(str.view(batch_a), "a")
+  let _bb: result<unit, fs.error> = files.write_text(str.view(batch_b), "b")
+  model.set_filter(state, "")
+  model.refresh(state)
+  model.select_pattern(state, 0, "batch-", false)
+  run_action(state, "copy", pending)
+  if not report("multi-copy", model.clipboard_count(state) == 2) { failures = failures + 1 }
+  run_action(state, "delete", pending)
+  if not report("multi-delete", not exists(str.view(batch_a)) and not exists(str.view(batch_b))) { failures = failures + 1 }
+
+  // open-tab last: it navigates away from the fixture directory.
+  let before_tabs: u64 = model.tab_count(state)
+  act(state, "open-tab", str.view(sub), pending)
+  if not report("open-tab", model.tab_count(state) == before_tabs + 1) { failures = failures + 1 }
+
+  io.write("failures ")
+  let failure_wide: i64 = cast.wrap(failures)
+  io.write(str.view(string.from_int(failure_wide)))
+  io.write("\n")
+  if failures == 0 { 0 } else { 1 }
+}
+
+// Headless check of the click -> action -> navigation path in every layout, used to keep
+// the file-manager interaction honest without a display.
+fn selftest(directory: str) -> i32 effects {alloc, env, fs.meta, fs.read, fs.write, io.write, process, time, ui} {
+  let settings_dir: string = "/tmp/airpolo-selftest"
+  let _mkdir: result<unit, fs.error> = files.mkdirs(str.view(settings_dir))
+  let settings_path: string = path.join(str.view(settings_dir), "settings.json")
+  var state: model.State = model.start(directory, str.view(settings_path))
+  let run_dir: string = path.join(str.view(settings_dir), "run")
+  let _mkrun: result<unit, fs.error> = files.mkdirs(str.view(run_dir))
+  model.set_run_dir(state, str.view(run_dir))
+  model.set_scale(state, 1)
+  struct.set(state, 0, field=view_mode)
+  var ui: w.Ui = w.new(1280, 800)
+  apply_theme(ui, state)
+  var all_ok: bool = true
+  io.write("settings colors: ")
+  if selftest_settings(ui, state, directory) { io.write("preview/cancel/apply/persist\n") } else { io.write("not integrated\n")
+    all_ok = false }
+  io.write("drag-drop: ")
+  if selftest_drop(ui, state, directory) { io.write("copies across\n") } else { io.write("no drop\n")
+    all_ok = false }
+  io.write("right-click: ")
+  if selftest_context(ui, state, directory) { io.write("opens actions\n") } else { io.write("no menu\n")
+    all_ok = false }
+  io.write("actions close: ")
+  if selftest_dialog(ui, state) { io.write("closes\n") } else { io.write("stuck\n")
+    all_ok = false }
+  io.write("multi-select: ")
+  if selftest_selection(ui, state, directory) { io.write("plain/control/shift\n") } else { io.write("not integrated\n")
+    all_ok = false }
+  io.write("per-pane tabs: ")
+  if selftest_pane_tabs(ui, state, directory) { io.write("new/switch/close\n") } else { io.write("not integrated\n")
+    all_ok = false }
+  io.write("focused hotkeys: ")
+  if selftest_hotkeys(ui, state, directory) { io.write("copy/paste/tabs/hidden/delete\n") } else { io.write("not integrated\n")
+    all_ok = false }
+  var layout: u64 = 0
+  loop {
+    if layout > 3 { break }
+    model.focus_pane(state, 0)
+    model.navigate(state, directory)
+    if layout == 3 { model.open_quad_tabs(state) }
+    struct.set(state, layout, field=layout)
+    struct.set(state, layout != 0, field=dual)
+    io.write("layout ")
+    let layout_wide: i64 = cast.wrap(layout)
+    io.write(str.view(string.from_int(layout_wide)))
+    io.write(": ")
+    if selftest_layout(ui, state, directory) { io.write("navigates\n") } else { io.write("no navigation\n")
+      all_ok = false }
+    layout = layout + 1
+  }
+  if all_ok { 0 } else { 1 }
+}
+
+fn click_key(ui: ref<w.Ui>, key: u64) -> bool effects {alloc} {
+  let index: u64 = w.find(ui, key)
+  if index == 0 { return false }
+  let box: gui.Rect = w.bounds_of(ui, index)
+  let point: w.Point = w.Point {x: box.x + box.width / 2, y: box.y + box.height / 2}
+  let _down: u64 = w.dispatch(ui, w.Input.PointerDown(point))
+  let _up: u64 = w.dispatch(ui, w.Input.PointerUp(point))
+  true
+}
+
+fn selftest_settings(ui: ref<w.Ui>, state: ref<model.State>, directory: str) -> bool effects {alloc, env, fs.meta, fs.read, fs.write, process, time} {
+  let original_background: u64 = state.theme_background
+  let original_accent: u64 = state.theme_accent
+  var pending: array<transfer.Plan> = array.new()
+  page.build(ui, state)
+  if not click_key(ui, page.key_settings()) { return false }
+  let _open: bool = handle_actions(ui, state, pending)
+  if state.dialog != model.dialog_settings() { return false }
+  page.build(ui, state)
+  if not click_key(ui, page.key_source_theme_base() + 3) { return false }
+  let _choose: bool = handle_actions(ui, state, pending)
+  if state.settings_background == original_background { return false }
+  if state.theme_background != state.settings_background { return false }
+  let painted_red: u64 = cast.wrap(ui.theme.background.r)
+  if painted_red != app_theme.red(state.theme_background) { return false }
+  if not click_key(ui, page.key_theme_revert()) { return false }
+  let _revert: bool = handle_actions(ui, state, pending)
+  if state.theme_background != original_background or state.theme_accent != original_accent { return false }
+  if not click_key(ui, page.key_dialog_cancel()) { return false }
+  let _cancel: bool = handle_actions(ui, state, pending)
+  if state.dialog != model.dialog_none() or state.theme_background != original_background or state.theme_accent != original_accent { return false }
+  page.build(ui, state)
+  if not click_key(ui, page.key_settings()) { return false }
+  let _reopen: bool = handle_actions(ui, state, pending)
+  page.build(ui, state)
+  if not click_key(ui, page.key_theme_background_base() + 3) { return false }
+  let _ocean: bool = handle_actions(ui, state, pending)
+  if not click_key(ui, page.key_theme_accent_base() + 2) { return false }
+  let _green: bool = handle_actions(ui, state, pending)
+  let chosen: u64 = state.settings_background
+  let chosen_accent: u64 = state.settings_accent
+  if not click_key(ui, page.key_dialog_ok()) { return false }
+  let _apply: bool = handle_actions(ui, state, pending)
+  if state.dialog != model.dialog_none() { return false }
+  var restarted: model.State = model.start(directory, str.view(state.settings_path))
+  restarted.theme_background == chosen and restarted.theme_accent == chosen_accent
+}
+
+fn settings_check(directory: str) -> i32 effects {alloc, env, fs.meta, fs.read, fs.write, io.write, process, time} {
+  let settings_dir: string = "/tmp/airpolo-settings-check"
+  let _mkdir: result<unit, fs.error> = files.mkdirs(str.view(settings_dir))
+  let settings_path: string = path.join(str.view(settings_dir), "settings.json")
+  var state: model.State = model.start(directory, str.view(settings_path))
+  model.set_scale(state, 1)
+  var ui: w.Ui = w.new(1280, 800)
+  apply_theme(ui, state)
+  if selftest_settings(ui, state, directory) {
+    io.write("settings themes/colors: instant-preview/revert/close/save/persist\n")
+    return 0
+  }
+  io.write("settings colors: FAIL\n")
+  1
+}
+
+fn selftest_hotkeys(ui: ref<w.Ui>, state: ref<model.State>, directory: str) -> bool effects {alloc, env, fs.meta, fs.read, fs.write, process} {
+  struct.set(state, 0, field=layout)
+  struct.set(state, false, field=dual)
+  model.focus_pane(state, 0)
+  model.navigate(state, directory)
+  model.set_selected(state, 0)
+  page.build(ui, state)
+  var pending: array<transfer.Plan> = array.new()
+  let copied: bool = handle_hotkey(ui, state, w.KeyPress {code: w.key_c(), shift: false, control: true}, pending)
+  if not copied or model.clipboard_count(state) == 0 { return false }
+  let pasted: bool = handle_hotkey(ui, state, w.KeyPress {code: w.key_v(), shift: false, control: true}, pending)
+  if not pasted or array.len(pending) != 1 or model.clipboard_count(state) != 0 { return false }
+  let before: u64 = model.pane_tab_count(state, 0)
+  let made_tab: bool = handle_hotkey(ui, state, w.KeyPress {code: 116, shift: false, control: true}, pending)
+  if not made_tab or model.pane_tab_count(state, 0) != before + 1 { return false }
+  let closed_tab: bool = handle_hotkey(ui, state, w.KeyPress {code: 119, shift: false, control: true}, pending)
+  if not closed_tab or model.pane_tab_count(state, 0) != before { return false }
+  let hidden: bool = state.show_hidden
+  let toggled: bool = handle_hotkey(ui, state, w.KeyPress {code: 104, shift: false, control: true}, pending)
+  if not toggled or state.show_hidden == hidden { return false }
+  model.set_selected(state, 0)
+  let trash: bool = handle_hotkey(ui, state, w.KeyPress {code: w.key_delete(), shift: false, control: false}, pending)
+  if not trash or state.dialog != model.dialog_confirm_delete() { return false }
+  close_dialog(state)
+  let permanent: bool = handle_hotkey(ui, state, w.KeyPress {code: w.key_delete(), shift: true, control: false}, pending)
+  let confirmed: bool = permanent and state.dialog == model.dialog_confirm_permanent_delete()
+  close_dialog(state)
+  confirmed
+}
+
+// Open the Actions dialog and click Cancel; report whether it closed.
+fn selftest_dialog(ui: ref<w.Ui>, state: ref<model.State>) -> bool effects {alloc, env, fs.meta, fs.read, fs.write, io.write, process, time, ui} {
+  open_actions(state)
+  page.build(ui, state)
+  let cancel: u64 = w.find(ui, page.key_dialog_cancel())
+  if cancel == 0 { return false }
+  let box: gui.Rect = w.bounds_of(ui, cancel)
+  let point: w.Point = w.Point { x: box.x + box.width / 2, y: box.y + box.height / 2 }
+  let _d: u64 = w.dispatch(ui, w.Input.PointerDown(point))
+  let _u: u64 = w.dispatch(ui, w.Input.PointerUp(point))
+  var pending: array<transfer.Plan> = array.new()
+  let _h: bool = handle_actions(ui, state, pending)
+  state.dialog == 0
+}
+
+// Drag the first row of pane 0 onto pane 1 and report whether a copy was queued.
+fn selftest_drop(ui: ref<w.Ui>, state: ref<model.State>, directory: str) -> bool effects {alloc, env, fs.meta, fs.read, fs.write, io.write, process, time, ui} {
+  struct.set(state, 1, field=layout)
+  struct.set(state, true, field=dual)
+  model.navigate(state, directory)
+  model.pane_navigate(state, 1, directory)
+  page.build(ui, state)
+  let t0: u64 = w.find(ui, page.key_files())
+  let t1: u64 = w.find(ui, page.key_files_other())
+  if t0 == 0 or t1 == 0 { return false }
+  let b0: gui.Rect = w.bounds_of(ui, t0)
+  let b1: gui.Rect = w.bounds_of(ui, t1)
+  let row_h: u32 = w.row_height(ui)
+  let line: u64 = cast.wrap(row_h)
+  let base0: u64 = cast.wrap(b0.y)
+  let base1: u64 = cast.wrap(b1.y)
+  let y0: u32 = cast.sat(base0 + 1 + line + line / 2)
+  let y1: u32 = cast.sat(base1 + 1 + line + line / 2)
+  let down: w.Point = w.Point { x: b0.x + 40, y: y0 }
+  let y1_wide: u64 = cast.wrap(y1)
+  let drag_wide: u64 = cast.wrap(w.drag_flag())
+  let flagged: u32 = cast.sat(or(y1_wide, drag_wide))
+  let over: w.Point = w.Point { x: b1.x + 40, y: flagged }
+  var pending: array<transfer.Plan> = array.new()
+  let _d: u64 = w.dispatch(ui, w.Input.PointerDown(down))
+  let _m: u64 = w.dispatch(ui, w.Input.PointerMove(over))
+  let _u: u64 = w.dispatch(ui, w.Input.PointerUp(over))
+  let _h: bool = handle_actions(ui, state, pending)
+  array.len(pending) == 1
+}
+
+// Right-click the first directory row and report whether the Actions menu opened.
+fn selftest_context(ui: ref<w.Ui>, state: ref<model.State>, directory: str) -> bool effects {alloc, env, fs.meta, fs.read, fs.write, io.write, process, time, ui} {
+  struct.set(state, 0, field=layout)
+  struct.set(state, false, field=dual)
+  model.navigate(state, directory)
+  page.build(ui, state)
+  let table: u64 = w.find(ui, page.key_files())
+  if table == 0 { return false }
+  let box: gui.Rect = w.bounds_of(ui, table)
+  let line: u64 = cast.wrap(w.row_height(ui))
+  let base_y: u64 = cast.wrap(box.y) + 1 + line + line / 2
+  let flagged: u32 = cast.sat(or(base_y, cast.wrap(w.secondary_flag())))
+  let point: w.Point = w.Point { x: box.x + 40, y: flagged }
+  let _d: u64 = w.dispatch(ui, w.Input.PointerDown(point))
+  var up: w.Point = point
+  let _u: u64 = w.dispatch(ui, w.Input.PointerUp(up))
+  var pending: array<transfer.Plan> = array.new()
+  let _h: bool = handle_actions(ui, state, pending)
+  state.dialog == model.dialog_actions()
+}
+
+// Drive real pointer modifiers through AirPolo's table and require the final range to reach
+// the application model, not only the generic widget's private state.
+fn selftest_selection(ui: ref<w.Ui>, state: ref<model.State>, directory: str) -> bool effects {alloc, env, fs.meta, fs.read, fs.write, io.write, process, time, ui} {
+  struct.set(state, 0, field=layout)
+  struct.set(state, false, field=dual)
+  model.navigate(state, directory)
+  page.build(ui, state)
+  let table: u64 = w.find(ui, page.key_files())
+  if table == 0 or w.row_count(ui, table) < 3 { return false }
+  let box: gui.Rect = w.bounds_of(ui, table)
+  let line: u64 = cast.wrap(w.row_height(ui))
+  let x: u32 = box.x + 40
+  let first_y: u64 = cast.wrap(box.y) + 1 + line + line / 2
+  let plain: w.Point = w.Point {x: x, y: cast.sat(first_y)}
+  let control_y: u32 = cast.sat(or(first_y + line, cast.wrap(w.control_pointer_flag())))
+  let controlled: w.Point = w.Point {x: x, y: control_y}
+  let shift_y: u32 = cast.sat(or(first_y + line * 2, cast.wrap(w.shift_pointer_flag())))
+  let shifted: w.Point = w.Point {x: x, y: shift_y}
+  let _p0: u64 = w.dispatch(ui, w.Input.PointerDown(plain))
+  let _p1: u64 = w.dispatch(ui, w.Input.PointerDown(controlled))
+  let _p2: u64 = w.dispatch(ui, w.Input.PointerDown(shifted))
+  var pending: array<transfer.Plan> = array.new()
+  let _handled: bool = handle_actions(ui, state, pending)
+  w.selection_count(ui, table) == 3 and model.pane_selection_count(state, 0) == 3
+}
+
+// Click pane 1's own tab controls and require them to mutate only that pane's active tab.
+fn selftest_pane_tabs(ui: ref<w.Ui>, state: ref<model.State>, directory: str) -> bool effects {alloc, env, fs.meta, fs.read, fs.write, io.write, process, time, ui} {
+  struct.set(state, 3, field=layout)
+  struct.set(state, true, field=dual)
+  model.open_quad_tabs(state)
+  model.pane_navigate(state, 1, directory)
+  page.build(ui, state)
+  let new_button: u64 = w.find(ui, page.key_pane_tab_new_base() + 1)
+  if new_button == 0 { return false }
+  let bounds: gui.Rect = w.bounds_of(ui, new_button)
+  let point: w.Point = w.Point {x: bounds.x + bounds.width / 2, y: bounds.y + bounds.height / 2}
+  let _down: u64 = w.dispatch(ui, w.Input.PointerDown(point))
+  let _up: u64 = w.dispatch(ui, w.Input.PointerUp(point))
+  var pending: array<transfer.Plan> = array.new()
+  let _handled: bool = handle_actions(ui, state, pending)
+  if model.pane_tab_count(state, 1) != 2 or model.pane_active(state, 1) != 1 { return false }
+  page.build(ui, state)
+  let first_tab: u64 = w.find(ui, page.key_pane_tab_base() + 128)
+  if first_tab == 0 { return false }
+  let tab_bounds: gui.Rect = w.bounds_of(ui, first_tab)
+  let tab_point: w.Point = w.Point {x: tab_bounds.x + tab_bounds.width / 2, y: tab_bounds.y + tab_bounds.height / 2}
+  let _tab_down: u64 = w.dispatch(ui, w.Input.PointerDown(tab_point))
+  let _tab_up: u64 = w.dispatch(ui, w.Input.PointerUp(tab_point))
+  let _tab_handled: bool = handle_actions(ui, state, pending)
+  if model.pane_active(state, 1) != 0 { return false }
+  model.pane_close_tab(state, 1)
+  model.pane_tab_count(state, 1) == 1
+}
+
+// Click the first directory row twice in the focused pane and report whether the active
+// directory changed. Relayouts between clicks exactly as the live loop does.
+fn selftest_layout(ui: ref<w.Ui>, state: ref<model.State>, directory: str) -> bool effects {alloc, env, fs.meta, fs.read, fs.write, io.write, process, time, ui} {
+  page.build(ui, state)
+  let table: u64 = w.find(ui, page.key_files())
+  if table == 0 { io.ewrite("no table\n")
+    return false }
+  let box: gui.Rect = w.bounds_of(ui, table)
+  let line: u64 = cast.wrap(w.row_height(ui))
+  var row: u64 = 0
+  var found: bool = false
+  var indices: array<u64> = model.visible(state)
+  var i: u64 = 0
+  loop {
+    if i >= array.len(indices) { break }
+    match model.entry_at_visible(state, i) {
+      some(value) => {
+        var item: fsops.Entry = value
+        if fsops.is_dir_of(item) {
+          row = i
+          found = true
+          break
+        }
+      },
+      none => {},
+    }
+    i = i + 1
+  }
+  if not found { io.ewrite("no directory row\n")
+    return false }
+  let y: u64 = cast.wrap(box.y) + 1 + line + row * line + line / 2
+  let x: u64 = cast.wrap(box.x) + 40
+  let before: string = model.current_dir(state)
+  var pending: array<transfer.Plan> = array.new()
+  let point: w.Point = w.Point { x: cast.sat(x), y: cast.sat(y) }
+  let _d1: u64 = w.dispatch(ui, w.Input.PointerDown(point))
+  let _u1: u64 = w.dispatch(ui, w.Input.PointerUp(point))
+  let _h1: bool = handle_actions(ui, state, pending)
+  page.build(ui, state)
+  let _d2: u64 = w.dispatch(ui, w.Input.PointerDown(point))
+  let _u2: u64 = w.dispatch(ui, w.Input.PointerUp(point))
+  let _h2: bool = handle_actions(ui, state, pending)
+  let after: string = model.current_dir(state)
+  not str.eq(str.view(before), str.view(after))
+}
+
+pub fn main(args: view<str>) -> i32 effects {alloc, env, fs.meta, fs.read, fs.write, io.write, net, process, thread, time, ui} {
+  var specs: array<cli.Option> = array.new()
+  array.push(specs, cli.option("path", "p", false))
+  array.push(specs, cli.option("render", "o", false))
+  array.push(specs, cli.option("list", "l", false))
+  array.push(specs, cli.option("action", "A", false))
+  array.push(specs, cli.flag("selftest", "T"))
+  array.push(specs, cli.flag("settings-check", "S"))
+  array.push(specs, cli.option("action-check", "K", false))
+  array.push(specs, cli.option("file", "f", false))
+  array.push(specs, cli.flag("hidden", "a"))
+  array.push(specs, cli.flag("window", "w"))
+  var parsed: cli.Parsed = match cli.parse(args, specs) {
+    ok(value) => value,
+    err(problem) => {
+      io.ewrite(str.view(cli.message(problem)))
+      io.ewrite("\nusage: airpolo [--path DIR] [--render DIR] [--list DIR] [--window]\n")
+      return 2
+    },
+  }
+  match cli.value(parsed, "list") {
+    some(dir) => { return print_entries(dir, cli.has(parsed, "hidden")) },
+    none => {},
+  }
+
+  var initial: string = string.new()
+  match cli.value(parsed, "path") {
+    some(value) => { initial = value },
+    none => {},
+  }
+  if cli.has(parsed, "selftest") { return selftest(str.view(initial)) }
+  if cli.has(parsed, "settings-check") { return settings_check(str.view(initial)) }
+  match cli.value(parsed, "action-check") {
+    some(target) => { return action_check(target) },
+    none => {},
+  }
+  var settings_dir: string = string.new()
+  match env.get("HOME") {
+    some(home) => {
+      settings_dir = path.join(str.view(home), ".config/airpolo")
+    },
+    none => { settings_dir = string.copy("/tmp/airpolo") },
+  }
+  let _mkdir: result<unit, fs.error> = files.mkdirs(str.view(settings_dir))
+  let settings_path: string = path.join(str.view(settings_dir), "settings.json")
+  var state: model.State = model.start(str.view(initial), str.view(settings_path))
+  match cli.value(parsed, "action") {
+    some(code) => {
+      match cli.value(parsed, "file") {
+        some(target) => {
+          let folder: string = string.copy(str.view(path.dirname(target)))
+          model.navigate(state, str.view(folder))
+          if str.eq(code, "pdf-merge") {
+            model.set_filter(state, "")
+          } else {
+            model.set_filter(state, str.view(path.basename(target)))
+            model.set_selected(state, 0)
+          }
+          var pending: array<transfer.Plan> = array.new()
+          run_action(state, code, pending)
+          io.write(str.view(state.message))
+          io.write("\n")
+          return 0
+        },
+        none => {
+          io.ewrite("--action needs --file PATH\n")
+          return 2
+        },
+      }
+    },
+    none => {},
+  }
+  var run_dir: string = path.join(str.view(settings_dir), "run")
+  let _mkrun: result<unit, fs.error> = files.mkdirs(str.view(run_dir))
+  model.set_run_dir(state, str.view(run_dir))
+  var cache: string = string.copy(str.view(path.dirname(str.view(log_path("scale.log")))))
+  let factor: u64 = uiscale.detect("AIRPOLO_SCALE", str.view(cache))
+  model.set_scale(state, factor)
+  let window_w: u32 = uiscale.px(factor, 1280)
+  let window_h: u32 = uiscale.px(factor, 800)
+  var ui: w.Ui = w.new(window_w, window_h)
+  apply_theme(ui, state)
+  let _font: bool = load_font(ui, factor)
+  var app: shell.Shell = match shell.offscreen("AirPolo", window_w, window_h) {
+    ok(value) => value,
+    err(problem) => {
+      io.ewrite(problem)
+      io.ewrite("\n")
+      return 1
+    },
+  }
+
+  var render_dir: string = string.new()
+  var headless: bool = false
+  match cli.value(parsed, "render") {
+    some(value) => {
+      string.append(render_dir, value)
+      headless = true
+    },
+    none => {},
+  }
+  if cli.has(parsed, "window") { headless = false }
+
+  if not headless and str.len(str.view(initial)) == 0 {
+    let _restored: bool = model.restore_session(state)
+  }
+
+  var status: i32 = 0
+  if headless {
+    // A render run is a test: keep its scripted settings out of the user's config.
+    var sandbox: string = string.copy(render_dir)
+    string.append(sandbox, "/settings.json")
+    let _moved: string = struct.replace(state, sandbox, field=settings_path)
+    status = scripted(ui, state, app, str.view(render_dir))
+  } else {
+    status = interactive(ui, state, app)
+  }
+  if not headless { let _session_saved: bool = model.save_session(state) }
+  model.save(state)
+  shell.close(app)
+  status
+}

@@ -1,0 +1,405 @@
+// Toolkit unit tests: formatting, classification, sorting and path helpers.
+module airpolo.tests.unit
+
+import std.testing as testing
+import std.files as files
+import std.text as text
+import std.draw as draw
+import std.image as image
+import std.pdf as pdf
+import std.widgets as w
+import "../toolkit/format.ai" as fmt
+import "../toolkit/fsops.ai" as fsops
+import "../toolkit/images.ai" as images
+import "../toolkit/archive.ai" as archive
+import "../toolkit/watch.ai" as watch
+import "../toolkit/mounts.ai" as mounts
+import "../toolkit/settings.ai" as prefs
+import "../toolkit/theme.ai" as app_theme
+import "../toolkit/transfer.ai" as transfer
+import "../toolkit/search.ai" as search
+import "../src/model.ai" as model
+
+fn make_pdf(path: str, pages: u64) -> result<unit, pdf.Error> effects {alloc, fs.write} {
+  var doc: pdf.PdfDoc = pdf.document()
+  let font: bytes = pdf.standard_font_object("Helvetica")
+  let font_obj: u64 = pdf.add_object(doc, bytes.view(font))
+  var i: u64 = 0
+  loop {
+    if i >= pages { break }
+    var page: pdf.Page = pdf.new_page(120.0, 120.0)
+    let name: string = pdf.page_add_font(page, font_obj)
+    let content: ref<pdf.Content> = struct.borrow(page, field=data)
+    pdf.begin_text(content)
+    pdf.set_font(content, str.view(name), 10.0)
+    pdf.text_pos(content, 10.0, 60.0)
+    pdf.show_text(content, "x")
+    pdf.end_text(content)
+    let _ = try pdf.finish_page(page, doc, false)
+    i = i + 1
+  }
+  pdf.save(doc, path)
+}
+
+pub fn main(args: view<str>) -> i32 effects {alloc, env, fs.meta, fs.read, fs.write, io.write, process, time} {
+  var suite: testing.Suite = testing.suite("airpolo", false)
+  if testing.start(suite, "human sizes are readable") {
+    let _ = testing.eq_str(suite, str.view(fmt.human_size(512)), "512 B", "bytes")
+    let _ = testing.eq_str(suite, str.view(fmt.human_size(2048)), "2 KiB", "kib")
+    let _ = testing.eq_str(suite, str.view(fmt.human_size(3 * 1024 * 1024)), "3 MiB", "mib")
+  }
+  if testing.start(suite, "classifies entries by extension") {
+    let _ = testing.eq_str(suite, str.view(fmt.kind_of("a.png", false, false)), "image", "image")
+    let _ = testing.eq_str(suite, str.view(fmt.kind_of("a.mkv", false, false)), "video", "video")
+    let _ = testing.eq_str(suite, str.view(fmt.kind_of("a.zip", false, false)), "archive", "archive")
+    let _ = testing.eq_str(suite, str.view(fmt.kind_of("a.ai", false, false)), "AIR source", "air")
+    let _ = testing.eq_str(suite, str.view(fmt.kind_of("dir", true, false)), "folder", "folder")
+    let _ = testing.eq_str(suite, str.view(fmt.kind_of("link", false, true)), "link", "link")
+  }
+  if testing.start(suite, "mount listing keeps real filesystems and drops pseudo ones") {
+    let root: string = match testing.temp_dir(suite, "airpolo-mounts") { ok(value) => value, err(_) => string.copy("/tmp") }
+    var file: string = string.copy(root)
+    string.append(file, "/mounts")
+    var body: string = string.copy("/dev/sda1 / ext4 rw 0 0\nproc /proc proc rw 0 0\ntmpfs /run tmpfs rw 0 0\n/dev/sdb1 /media/usb vfat rw 0 0\n")
+    let _written: result<unit, fs.error> = files.write_text(str.view(file), str.view(body))
+    var found: array<mounts.Mount> = mounts.list(str.view(file))
+    let _ = testing.eq_u64(suite, array.len(found), 2, "only real filesystems")
+    let _ = testing.eq_str(suite, str.view(mounts.device_of(array.borrow(found, 0))), "/dev/sda1", "first device")
+    let _ = testing.eq_str(suite, str.view(mounts.point_of(array.borrow(found, 1))), "/media/usb", "second mount point")
+  }
+
+  if testing.start(suite, "settings round-trip preserves the versioned schema") {
+    let root: string = match testing.temp_dir(suite, "airpolo-prefs") { ok(value) => value, err(_) => string.copy("/tmp") }
+    var file: string = string.copy(root)
+    string.append(file, "/settings.json")
+    var state: prefs.Settings = prefs.defaults()
+    struct.set(state, true, field=show_hidden)
+    struct.set(state, 2, field=sort_mode)
+    struct.set(state, 2, field=layout)
+    struct.set(state, false, field=toolbar_labels)
+    struct.set(state, 24, field=icon_size)
+    struct.set(state, app_theme.pack(12, 34, 56), field=theme_background)
+    struct.set(state, app_theme.pack(78, 90, 123), field=theme_accent)
+    array.push(struct.borrow(state, field=bookmarks), string.copy("/home/alex"))
+    prefs.save(str.view(file), state)
+    var loaded: prefs.Settings = prefs.load(str.view(file))
+    let _ = testing.eq_u64(suite, loaded.version, prefs.schema_version(), "schema version")
+    let _ = testing.eq_bool(suite, loaded.show_hidden, true, "show_hidden")
+    let _ = testing.eq_u64(suite, loaded.sort_mode, 2, "sort mode")
+    let _ = testing.eq_u64(suite, loaded.layout, 2, "layout")
+    let _ = testing.eq_bool(suite, loaded.toolbar_labels, false, "toolbar labels")
+    let _ = testing.eq_u64(suite, loaded.icon_size, 24, "icon size")
+    let _ = testing.eq_u64(suite, loaded.theme_background, app_theme.pack(12, 34, 56), "background color")
+    let _ = testing.eq_u64(suite, loaded.theme_accent, app_theme.pack(78, 90, 123), "accent color")
+    let _ = testing.eq_u64(suite, array.len(struct.borrow(loaded, field=bookmarks)), 1, "bookmarks")
+    let _ = testing.eq_str(suite, str.view(array.borrow(struct.borrow(loaded, field=bookmarks), 0)), "/home/alex", "bookmark value")
+    // A pre-version-2 file with `dual: true` migrates to layout 1.
+    var legacy: string = string.copy(root)
+    string.append(legacy, "/legacy.json")
+    let _legacy: result<unit, fs.error> = files.write_text(str.view(legacy), "{\n  \"dual\": true,\n  \"show_hidden\": true\n}\n")
+    var migrated: prefs.Settings = prefs.load(str.view(legacy))
+    let _ = testing.eq_u64(suite, migrated.layout, 1, "legacy dual migrates to layout")
+    let _ = testing.eq_u64(suite, migrated.version, prefs.schema_version(), "legacy upgraded version")
+  }
+
+  if testing.start(suite, "themes derive every control color from app settings") {
+    let packed: u64 = app_theme.pack(12, 34, 56)
+    let _ = testing.eq_u64(suite, app_theme.red(packed), 12, "red channel")
+    let _ = testing.eq_u64(suite, app_theme.green(packed), 34, "green channel")
+    let _ = testing.eq_u64(suite, app_theme.blue(packed), 56, "blue channel")
+    let changed: u64 = app_theme.with_channel(packed, 1, 200)
+    let _ = testing.eq_u64(suite, app_theme.green(changed), 200, "channel edit")
+    let _ = testing.eq_u64(suite, app_theme.background_choice(3), app_theme.pack(8, 35, 48), "Ocean background")
+    var dark: w.Theme = app_theme.palette(app_theme.preset_background(1), app_theme.preset_accent(1))
+    let _ = testing.eq_u64(suite, cast.wrap(dark.background.r), 23, "dark background reaches widget theme")
+    let _ = testing.eq_u64(suite, cast.wrap(dark.accent.b), 246, "accent reaches widget theme")
+    let _ = testing.eq_u64(suite, app_theme.source_theme_count(), 7, "source theme count")
+    var serenity: w.Theme = app_theme.source_theme(0)
+    let _ = testing.eq_u64(suite, cast.wrap(serenity.background.r), 26, "Serenity window background")
+    let _ = testing.eq_u64(suite, cast.wrap(serenity.surface.g), 33, "Serenity child background")
+    let _ = testing.eq_u64(suite, cast.wrap(serenity.accent.b), 238, "Serenity accent")
+    let _ = testing.eq_u64(suite, cast.wrap(serenity.selection.a), 100, "Serenity selection alpha")
+    var moonlight: w.Theme = app_theme.source_theme(1)
+    let _ = testing.eq_u64(suite, cast.wrap(moonlight.accent.r), 248, "Moonlight accent")
+    var monochrome: w.Theme = app_theme.source_theme(2)
+    let _ = testing.eq_u64(suite, cast.wrap(monochrome.surface.a), 255, "Monochrome dialog surface is opaque")
+    let _ = testing.eq_u64(suite, cast.wrap(monochrome.shade.r), 20, "Monochrome frame is precomposited")
+    var nord: w.Theme = app_theme.source_theme(3)
+    let _ = testing.eq_u64(suite, cast.wrap(nord.background.r), 46, "Nord background")
+    let _ = testing.eq_u64(suite, cast.wrap(nord.ink.a), 224, "Nord text alpha")
+    var cyberpunk: w.Theme = app_theme.palette(app_theme.source_theme_background(6), app_theme.source_theme_accent(6))
+    let _ = testing.eq_u64(suite, cast.wrap(cyberpunk.background.b), 31, "Cyberpunk source palette selected")
+    let _ = testing.eq_u64(suite, cast.wrap(cyberpunk.accent.g), 250, "Cyberpunk accent")
+    let _ = testing.eq_u64(suite, cast.wrap(cyberpunk.shade.a), 51, "Cyberpunk frame alpha")
+  }
+
+  if testing.start(suite, "appearance preview cancels or persists atomically") {
+    let root: string = match testing.temp_dir(suite, "airpolo-theme-state") { ok(value) => value, err(_) => string.copy("/tmp") }
+    let settings_path: string = text.concat(root, "/settings.json")
+    var state: model.State = model.start(str.view(root), str.view(settings_path))
+    let original: u64 = state.theme_background
+    model.open_settings(state)
+    model.set_settings_theme(state, 3)
+    let _ = testing.eq_u64(suite, state.theme_background, original, "draft does not apply without preview update")
+    let _ = testing.eq_bool(suite, state.settings_background != original, true, "choice updates dialog preview")
+    model.preview_settings(state)
+    let _ = testing.eq_bool(suite, state.theme_background != original, true, "preview applies draft")
+    model.revert_settings(state)
+    let _ = testing.eq_u64(suite, state.theme_background, original, "revert restores saved theme")
+    model.cancel_settings(state)
+    let _ = testing.eq_u64(suite, state.theme_background, original, "cancel restores original")
+    model.open_settings(state)
+    model.set_settings_preset(state, 2)
+    let chosen: u64 = state.settings_background
+    model.apply_settings(state)
+    model.save(state)
+    var loaded: prefs.Settings = prefs.load(str.view(settings_path))
+    let _ = testing.eq_u64(suite, loaded.theme_background, chosen, "apply persists selected theme")
+  }
+
+  if testing.start(suite, "background transfer copies files and reports progress") {
+    var root: string = match testing.temp_dir(suite, "airpolo-xfer") { ok(value) => value, err(_) => string.copy("/tmp") }
+    var src_dir: string = string.copy(root)
+    string.append(src_dir, "/src")
+    var dest_dir: string = string.copy(root)
+    string.append(dest_dir, "/dest")
+    let _a: result<unit, fs.error> = files.mkdirs(str.view(src_dir))
+    var file: string = string.copy(src_dir)
+    string.append(file, "/a.txt")
+    let _b: result<unit, fs.error> = files.write_text(str.view(file), "hello")
+    var sources: array<string> = array.new()
+    array.push(sources, string.copy(str.view(file)))
+    let progress: string = text.concat(dest_dir, "/progress")
+    var plan: transfer.Plan = transfer.Plan {
+      sources: sources, dest_dir: string.copy(dest_dir), cut: false,
+      signal: string.new(), progress: progress
+    }
+    var outcome: transfer.Outcome = transfer.run(plan)
+    let _ = testing.eq_u64(suite, outcome.copied, 1, "one item copied")
+    let copied_file: string = text.concat(dest_dir, "/a.txt")
+    match files.exists(str.view(copied_file)) {
+      ok(value) => { let _ = testing.eq_bool(suite, value, true, "destination exists") },
+      err(_) => { let _ = testing.fail(suite, "exists", "ok", "err") },
+    }
+  }
+
+  if testing.start(suite, "recursive search finds names below the root") {
+    var root: string = match testing.temp_dir(suite, "airpolo-find") { ok(value) => value, err(_) => string.copy("/tmp") }
+    var nested: string = text.concat(root, "/a/b")
+    let _m: result<unit, fs.error> = files.mkdirs(str.view(nested))
+    let _f1: result<unit, fs.error> = files.write_text(str.view(text.concat(root, "/alpha.txt")), "x")
+    let _f2: result<unit, fs.error> = files.write_text(str.view(text.concat(nested, "/beta-alpha.txt")), "y")
+    var hits: array<search.Hit> = search.find(str.view(root), "alpha", 50)
+    let _ = testing.eq_u64(suite, array.len(hits), 2, "both files found")
+  }
+
+  if testing.start(suite, "image toolkit loads, rotates, resizes and grayscales") {
+    let root: string = match testing.temp_dir(suite, "airpolo-img") { ok(value) => value, err(_) => string.copy("/tmp") }
+    let seed: string = text.concat(root, "/seed.png")
+    match draw.surface(4, 2) {
+      some(value) => {
+        var surface: draw.Surface = value
+        let encoded: bytes = image.encode_png(surface)
+        let _w: result<unit, fs.error> = files.write_bytes(str.view(seed), bytes.view(encoded))
+      },
+      none => { let _ = testing.fail(suite, "surface", "some", "none") },
+    }
+    match images.load(str.view(seed)) {
+      some(value) => {
+        var picture: images.Image = value
+        let _ = testing.eq_u64(suite, cast.wrap(picture.width), 4, "loaded width")
+        let _ = testing.eq_u64(suite, cast.wrap(picture.height), 2, "loaded height")
+        match images.rotate90(picture, true) {
+          some(rotated) => {
+            let _ = testing.eq_u64(suite, cast.wrap(rotated.width), 2, "rotated width")
+            let _ = testing.eq_u64(suite, cast.wrap(rotated.height), 4, "rotated height")
+          },
+          none => { let _ = testing.fail(suite, "rotate", "some", "none") },
+        }
+        match images.resize(picture, 8, 8) {
+          some(scaled) => { let _ = testing.eq_u64(suite, cast.wrap(scaled.width), 8, "resized width") },
+          none => { let _ = testing.fail(suite, "resize", "some", "none") },
+        }
+        match images.grayscale(picture) {
+          some(_) => { let _ = testing.eq_u64(suite, 1, 1, "grayscale ok") },
+          none => { let _ = testing.fail(suite, "grayscale", "some", "none") },
+        }
+      },
+      none => { let _ = testing.fail(suite, "load", "some", "none") },
+    }
+  }
+
+  if testing.start(suite, "pdf toolkit merges, splits and rotates pages") {
+    let root: string = match testing.temp_dir(suite, "airpolo-pdf") { ok(value) => value, err(_) => string.copy("/tmp") }
+    let first: string = text.concat(root, "/a.pdf")
+    let second: string = text.concat(root, "/b.pdf")
+    match make_pdf(str.view(first), 2) {
+      ok(_) => {},
+      err(_) => { let _ = testing.fail(suite, "make a", "ok", "err") },
+    }
+    match make_pdf(str.view(second), 1) {
+      ok(_) => {},
+      err(_) => { let _ = testing.fail(suite, "make b", "ok", "err") },
+    }
+    var inputs: array<string> = array.new()
+    array.push(inputs, string.copy(str.view(first)))
+    array.push(inputs, string.copy(str.view(second)))
+    let merged_path: string = text.concat(root, "/merged.pdf")
+    match pdf.merge_files(inputs, str.view(merged_path)) {
+      ok(count) => { let _ = testing.eq_u64(suite, count, 3, "merged pages") },
+      err(_) => { let _ = testing.fail(suite, "merge", "ok", "err") },
+    }
+    match pdf.split_file(str.view(merged_path), str.view(root), "part") {
+      ok(count) => { let _ = testing.eq_u64(suite, count, 3, "split pages") },
+      err(_) => { let _ = testing.fail(suite, "split", "ok", "err") },
+    }
+    let rotated_path: string = text.concat(root, "/rotated.pdf")
+    match pdf.rotate_file(str.view(merged_path), str.view(rotated_path), 90) {
+      ok(count) => { let _ = testing.eq_u64(suite, count, 3, "rotated pages") },
+      err(_) => { let _ = testing.fail(suite, "rotate", "ok", "err") },
+    }
+  }
+
+  if testing.start(suite, "permissions render, parse and apply") {
+    let root: string = match testing.temp_dir(suite, "airpolo-perm") { ok(value) => value, err(_) => string.copy("/tmp") }
+    let target: string = text.concat(root, "/perm.txt")
+    let _w: result<unit, fs.error> = files.write_text(str.view(target), "x")
+    let _ = testing.eq_str(suite, str.view(fsops.octal_text(420)), "0644", "octal text")
+    let _ = testing.eq_str(suite, str.view(fsops.permission_text(420, false)), "-rw-r--r--", "rwx text")
+    let parsed: u64 = match fsops.parse_octal("600") { some(value) => value, none => 0 }
+    let _ = testing.eq_u64(suite, parsed, 384, "parse octal")
+    let applied: bool = match fsops.set_permissions(str.view(target), 384) { ok(_) => true, err(_) => false }
+    let _ = testing.eq_bool(suite, applied, true, "chmod succeeds")
+    let bits: u64 = match fsops.permissions_of(str.view(target)) { some(value) => value, none => 0 }
+    let _ = testing.eq_u64(suite, bits, 384, "chmod applied")
+  }
+
+  if testing.start(suite, "native zip creates, lists and extracts") {
+    let root: string = match testing.temp_dir(suite, "airpolo-zip") { ok(value) => value, err(_) => string.copy("/tmp") }
+    var src: string = text.concat(root, "/src")
+    let _m: result<unit, fs.error> = files.mkdirs(str.view(src))
+    let _a: result<unit, fs.error> = files.write_text(str.view(text.concat(src, "/one.txt")), "alpha")
+    let _b: result<unit, fs.error> = files.write_text(str.view(text.concat(src, "/two.txt")), "beta")
+    var members: array<string> = array.new()
+    array.push(members, text.concat(src, "/one.txt"))
+    array.push(members, text.concat(src, "/two.txt"))
+    let archive_path: string = text.concat(root, "/bundle.zip")
+    let log: string = text.concat(root, "/zip.log")
+    let made: bool = match archive.create(str.view(archive_path), members, str.view(log)) { ok(_) => true, err(_) => false }
+    let _ = testing.eq_bool(suite, made, true, "zip created")
+    match archive.list_entries(str.view(archive_path), str.view(log)) {
+      ok(found) => {
+        var entries: array<string> = found
+        let _ = testing.eq_u64(suite, array.len(entries), 2, "two entries listed")
+      },
+      err(_) => { let _ = testing.fail(suite, "list", "ok", "err") },
+    }
+    var out_dir: string = text.concat(root, "/out")
+    let _o: result<unit, fs.error> = files.mkdirs(str.view(out_dir))
+    let extracted: bool = match archive.extract(str.view(archive_path), str.view(out_dir), str.view(log)) { ok(_) => true, err(_) => false }
+    let _ = testing.eq_bool(suite, extracted, true, "zip extracted")
+    match files.read_text(str.view(text.concat(out_dir, "/one.txt"))) {
+      ok(value) => { let _ = testing.eq_str(suite, str.view(value), "alpha", "extracted content") },
+      err(_) => { let _ = testing.fail(suite, "read", "ok", "err") },
+    }
+  }
+
+  if testing.start(suite, "directory watcher detects external change") {
+    let root: string = match testing.temp_dir(suite, "airpolo-watch") { ok(value) => value, err(_) => string.copy("/tmp") }
+    let _mk: result<unit, fs.error> = files.mkdirs(str.view(root))
+    var watcher: watch.Watcher = watch.track(str.view(root))
+    let _ = testing.eq_bool(suite, watch.changed(watcher), false, "initially unchanged")
+    let _w: result<unit, fs.error> = files.write_text(str.view(text.concat(root, "/new.txt")), "x")
+    let _ = testing.eq_bool(suite, watch.changed(watcher), true, "external change detected")
+    watch.mark(watcher)
+    let _ = testing.eq_bool(suite, watch.changed(watcher), false, "clean after mark")
+  }
+
+  if testing.start(suite, "Polo multi-selection drives batch operations") {
+    let root: string = match testing.temp_dir(suite, "airpolo-selection") { ok(value) => value, err(_) => string.copy("/tmp") }
+    let _a: result<unit, fs.error> = files.write_text(str.view(text.concat(root, "/alpha.txt")), "a")
+    let _b: result<unit, fs.error> = files.write_text(str.view(text.concat(root, "/beta.txt")), "b")
+    let _c: result<unit, fs.error> = files.write_text(str.view(text.concat(root, "/gamma.txt")), "c")
+    let settings_path: string = text.concat(root, "/settings.json")
+    var state: model.State = model.start(str.view(root), str.view(settings_path))
+
+    model.select_pattern(state, 0, "bet", false)
+    let _ = testing.eq_u64(suite, model.pane_selection_count(state, 0), 1, "pattern selects one")
+    var patterned: array<fsops.Entry> = model.selected_entries(state)
+    let _ = testing.eq_str(suite, array.borrow(patterned, 0).name, "beta.txt", "pattern selection identity")
+
+    model.invert_selection(state, 0)
+    let _ = testing.eq_u64(suite, model.pane_selection_count(state, 0), 2, "invert selects complement")
+    model.copy_selection(state, false)
+    let _ = testing.eq_u64(suite, model.clipboard_count(state), 2, "copy batches selected items")
+
+    model.select_all(state, 0)
+    let _ = testing.eq_u64(suite, model.pane_selection_count(state, 0), 3, "select all includes every row")
+    var positions: array<u64> = array.new()
+    array.push(positions, 0)
+    array.push(positions, 2)
+    model.set_pane_selection(state, 0, positions, 2)
+    let _ = testing.eq_u64(suite, model.pane_selection_count(state, 0), 2, "explicit toggle set persists")
+  }
+
+  if testing.start(suite, "every pane owns independent tabs and history") {
+    let root: string = match testing.temp_dir(suite, "airpolo-pane-tabs") { ok(value) => value, err(_) => string.copy("/tmp") }
+    let child: string = text.concat(root, "/child")
+    let _child: result<unit, fs.error> = files.mkdirs(str.view(child))
+    let settings_path: string = text.concat(root, "/settings.json")
+    var state: model.State = model.start(str.view(root), str.view(settings_path))
+    model.set_layout(state, 3)
+    model.open_quad_tabs(state)
+    var pane: u64 = 0
+    loop {
+      if pane >= 4 { break }
+      model.pane_navigate(state, pane, str.view(root))
+      model.pane_new_tab(state, pane)
+      let _ = testing.eq_u64(suite, model.pane_tab_count(state, pane), 2, "new tab belongs to pane")
+      model.pane_navigate(state, pane, str.view(child))
+      model.pane_back(state, pane)
+      let _ = testing.eq_str(suite, str.view(model.pane_dir(state, pane)), str.view(root), "pane back restores its tab")
+      model.pane_forward(state, pane)
+      let _ = testing.eq_str(suite, str.view(model.pane_dir(state, pane)), str.view(child), "pane forward restores its tab")
+      model.pane_switch_tab(state, pane, 0)
+      let _ = testing.eq_str(suite, str.view(model.pane_dir(state, pane)), str.view(root), "other tab keeps its path")
+      model.pane_close_tab(state, pane)
+      let _ = testing.eq_u64(suite, model.pane_tab_count(state, pane), 1, "close affects one pane")
+      pane = pane + 1
+    }
+    model.pane_navigate(state, 2, str.view(child))
+    model.pane_navigate(state, 3, str.view(root))
+    model.focus_pane(state, 2)
+    let _ = testing.eq_u64(suite, model.opposite_pane(state, 2), 3, "quad opposite pane")
+    let _ = testing.eq_str(suite, str.view(model.focused_dir(state)), str.view(child), "focused directory follows pane")
+    let _ = testing.eq_str(suite, str.view(model.opposite_dir(state)), str.view(root), "opposite directory follows quad pair")
+  }
+
+  if testing.start(suite, "pane tabs and layout survive a restart") {
+    let root: string = match testing.temp_dir(suite, "airpolo-session") { ok(value) => value, err(_) => string.copy("/tmp") }
+    let child: string = text.concat(root, "/child")
+    let _child: result<unit, fs.error> = files.mkdirs(str.view(child))
+    let settings_path: string = text.concat(root, "/settings.json")
+    var before: model.State = model.start(str.view(root), str.view(settings_path))
+    model.set_layout(before, 3)
+    model.open_quad_tabs(before)
+    model.pane_new_tab(before, 0)
+    model.pane_navigate(before, 0, str.view(child))
+    model.pane_navigate(before, 2, str.view(child))
+    model.focus_pane(before, 2)
+    let _ = testing.eq_bool(suite, model.save_session(before), true, "session saved")
+
+    var after: model.State = model.start(str.view(root), str.view(settings_path))
+    let _ = testing.eq_bool(suite, model.restore_session(after), true, "session restored")
+    let _ = testing.eq_u64(suite, model.layout_mode(after), 3, "quad layout restored")
+    let _ = testing.eq_u64(suite, after.focus, 2, "focused pane restored")
+    let _ = testing.eq_u64(suite, model.pane_tab_count(after, 0), 2, "tab list restored")
+    let _ = testing.eq_str(suite, str.view(model.pane_dir(after, 0)), str.view(child), "active tab path restored")
+    let _ = testing.eq_str(suite, str.view(model.pane_dir(after, 2)), str.view(child), "quad pane path restored")
+
+    let _bad: result<unit, fs.error> = files.write_text(str.view(after.session_path), "{\"version\":999}")
+    let _ = testing.eq_bool(suite, model.restore_session(after), false, "unknown schema rejected")
+  }
+
+  testing.conclude(suite, "airpolo", 60)
+}

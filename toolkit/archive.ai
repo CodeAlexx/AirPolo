@@ -1,0 +1,195 @@
+// Reusable archive create/extract through the installed 7-Zip and tar, with argv-only
+// invocation (no shell string) and a plain string error carrying the tool's own message.
+module airpolo.toolkit.archive
+
+import std.files as files
+import std.process as proc
+import std.path as path
+import std.text as text
+import std.zip as zip
+import "format.ai" as fmt
+
+pub type Kind = enum { SevenZip, Zip, Tar, Unknown }
+
+pub fn detect(name: str) -> Kind effects {alloc} {
+  let ext: string = text.lower_ascii(str.view(path.extension(name)))
+  if str.eq(str.view(ext), ".zip") { return Kind.Zip }
+  if str.eq(str.view(ext), ".7z") or str.eq(str.view(ext), ".rar") {
+    return Kind.SevenZip
+  }
+  if str.eq(str.view(ext), ".tar") or str.eq(str.view(ext), ".gz") or str.eq(str.view(ext), ".xz")
+     or str.eq(str.view(ext), ".bz2") or str.eq(str.view(ext), ".zst") {
+    return Kind.Tar
+  }
+  Kind.Unknown
+}
+
+fn reason(log: str) -> string effects {alloc, fs.meta, fs.read} {
+  let tail: string = proc.tail(log, 2048)
+  if str.len(str.view(tail)) != 0 { return tail }
+  string.copy("archive tool failed")
+}
+
+// Create an archive from `members` (absolute paths) at `destination`.
+fn zip_add(entries: ref<array<zip.NewEntry>>, target: str, name: str) -> unit effects {alloc, fs.meta, fs.read} {
+  match files.is_dir(target) {
+    ok(is_directory) => {
+      if is_directory {
+        var folder: string = string.copy(name)
+        string.append(folder, "/")
+        array.push(entries, zip.new_entry(str.view(folder), bytes.copy(b""), false))
+        match files.list_dir(target) {
+          ok(found) => {
+            var names: array<string> = found
+            var i: u64 = 0
+            loop {
+              if i >= array.len(names) { break }
+              var child_name: string = string.copy(name)
+              string.append(child_name, "/")
+              string.append(child_name, str.view(array.borrow(names, i)))
+              let child: string = path.join(target, str.view(array.borrow(names, i)))
+              zip_add(entries, str.view(child), str.view(child_name))
+              i = i + 1
+            }
+          },
+          err(_) => {},
+        }
+        return ()
+      }
+    },
+    err(_) => {},
+  }
+  match files.read_bytes(target) {
+    ok(data) => { array.push(entries, zip.new_entry(name, data, true)) },
+    err(_) => {},
+  }
+  ()
+}
+
+fn create_zip(destination: str, members: ref<array<string>>) -> result<unit, string> effects {alloc, fs.meta, fs.read, fs.write} {
+  var entries: array<zip.NewEntry> = array.new()
+  var i: u64 = 0
+  loop {
+    if i >= array.len(members) { break }
+    let member: str = str.view(array.borrow(members, i))
+    zip_add(entries, member, str.view(path.basename(member)))
+    i = i + 1
+  }
+  match zip.write_file(destination, entries) {
+    ok(_) => result.ok(()),
+    err(error) => {
+      var problem: zip.Error = error
+      result.err(string.copy(str.view(zip.message(problem))))
+    },
+  }
+}
+
+pub fn create(destination: str, members: ref<array<string>>, log: str) -> result<unit, string> effects {alloc, process, fs.read, fs.write, fs.meta} {
+  if detect(destination) == Kind.Zip { return create_zip(destination, members) }
+  var argv: array<string> = array.new()
+  array.push(argv, string.copy("7z"))
+  array.push(argv, string.copy("a"))
+  array.push(argv, string.copy("-bd"))
+  array.push(argv, string.copy(destination))
+  var i: u64 = 0
+  loop {
+    if i >= array.len(members) { break }
+    array.push(argv, string.copy(str.view(array.borrow(members, i))))
+    i = i + 1
+  }
+  match proc.run(argv, "/", log, false) {
+    ok(status) => {
+      if proc.success(status) { result.ok(()) }
+      else { result.err(reason(log)) }
+    },
+    err(error) => result.err(string.copy(fs.error.message(error))),
+  }
+}
+
+// Extract `archive` into `directory`.
+pub fn extract(archive: str, directory: str, log: str) -> result<unit, string> effects {alloc, process, fs.read, fs.meta, fs.write} {
+  if detect(archive) == Kind.Zip {
+    match zip.extract_file(archive, directory) {
+      ok(_) => { return result.ok(()) },
+      err(error) => {
+        var problem: zip.Error = error
+        return result.err(string.copy(str.view(zip.message(problem))))
+      },
+    }
+  }
+  let _made: result<unit, fs.error> = files.mkdirs(directory)
+  var argv: array<string> = array.new()
+  array.push(argv, string.copy("7z"))
+  array.push(argv, string.copy("x"))
+  array.push(argv, string.copy("-y"))
+  array.push(argv, string.copy("-bd"))
+  var out_arg: string = string.copy("-o")
+  string.append(out_arg, directory)
+  array.push(argv, out_arg)
+  array.push(argv, string.copy(archive))
+  match proc.run(argv, "/", log, false) {
+    ok(status) => {
+      if proc.success(status) { result.ok(()) }
+      else { result.err(reason(log)) }
+    },
+    err(error) => result.err(string.copy(fs.error.message(error))),
+  }
+}
+
+// List an archive's entries (one name per line) using `7z l -ba`.
+pub fn list_entries(archive: str, log: str) -> result<array<string>, string> effects {alloc, process, fs.read, fs.meta} {
+  if detect(archive) == Kind.Zip {
+    match zip.read_file(archive) {
+      ok(found) => {
+        var entries: array<zip.Entry> = found
+        var out: array<string> = array.new()
+        var i: u64 = 0
+        loop {
+          if i >= array.len(entries) { break }
+          array.push(out, zip.name_of(array.borrow(entries, i)))
+          i = i + 1
+        }
+        return result.ok(out)
+      },
+      err(error) => {
+        var problem: zip.Error = error
+        return result.err(string.copy(str.view(zip.message(problem))))
+      },
+    }
+  }
+  var argv: array<string> = array.new()
+  array.push(argv, string.copy("7z"))
+  array.push(argv, string.copy("l"))
+  array.push(argv, string.copy("-ba"))
+  array.push(argv, string.copy("-bd"))
+  array.push(argv, string.copy(archive))
+  match proc.run(argv, "/", log, false) {
+    ok(status) => {
+      if not proc.success(status) { return result.err(reason(log)) }
+      let body: string = match files.read_text(log) { ok(value) => value, err(_) => string.new() }
+      var out: array<string> = array.new()
+      var lines: array<string> = text.lines(str.view(body))
+      var i: u64 = 0
+      loop {
+        if i >= array.len(lines) { break }
+        let line: str = text.trim(str.view(array.borrow(lines, i)))
+        if str.len(line) != 0 {
+          // `7z l -ba` columns: date time attr size compressed name...
+          var parts: array<string> = text.split(line, " ")
+          var name: string = string.new()
+          var p: u64 = 5
+          loop {
+            if p >= array.len(parts) { break }
+            if str.len(str.view(name)) != 0 { string.append(name, " ") }
+            string.append(name, str.view(array.borrow(parts, p)))
+            p = p + 1
+          }
+          if str.len(str.view(name)) != 0 { array.push(out, name) }
+        }
+        i = i + 1
+      }
+      result.ok(out)
+    },
+    err(error) => result.err(string.copy(fs.error.message(error))),
+  }
+}

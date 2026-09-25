@@ -1,0 +1,61 @@
+// Reusable mount/device listing for file managers. Reads /proc/mounts and keeps the
+// filesystems a person navigates to, hiding kernel pseudo-filesystems.
+module airpolo.toolkit.mounts
+
+import std.files as files
+import std.text as text
+
+pub type Mount = struct {
+  device: string,
+  point: string,
+  fstype: string
+}
+
+fn interesting(fstype: str, device: str) -> bool effects {alloc} {
+  // Snap's many loop devices are not user-navigable mounts.
+  if str.starts_with(device, "/dev/loop") { return false }
+  if str.starts_with(device, "/dev/") { return true }
+  if str.starts_with(fstype, "fuse") { return true }
+  if str.starts_with(fstype, "nfs") or str.starts_with(fstype, "cifs") { return true }
+  if str.eq(fstype, "iso9660") or str.eq(fstype, "udf") { return true }
+  false
+}
+
+fn unescape(value: str) -> string effects {alloc} {
+  // /proc/mounts escapes space as \040 and tab as \011.
+  var out: string = text.replace(value, "\\040", " ")
+  out = text.replace(str.view(out), "\\011", "\t")
+  out
+}
+
+pub fn device_of(m: ref<Mount>) -> string effects {alloc} { string.copy(m.device) }
+pub fn point_of(m: ref<Mount>) -> string effects {alloc} { string.copy(m.point) }
+pub fn fstype_of(m: ref<Mount>) -> string effects {alloc} { string.copy(m.fstype) }
+
+pub fn list(path: str) -> array<Mount> effects {alloc, fs.read, fs.meta} {
+  var out: array<Mount> = array.new()
+  match files.read_text(path) {
+    ok(body) => {
+      var lines: array<string> = text.lines(str.view(body))
+      var i: u64 = 0
+      loop {
+        if i >= array.len(lines) { break }
+        let line: str = str.view(array.borrow(lines, i))
+        if str.len(line) != 0 {
+          var fields: array<string> = text.split(line, " ")
+          if array.len(fields) >= 3 {
+            let device: string = unescape(str.view(array.borrow(fields, 0)))
+            let point: string = unescape(str.view(array.borrow(fields, 1)))
+            let fstype: string = string.copy(str.view(array.borrow(fields, 2)))
+            if interesting(str.view(fstype), str.view(device)) {
+              array.push(out, Mount {device: device, point: point, fstype: fstype})
+            }
+          }
+        }
+        i = i + 1
+      }
+    },
+    err(_) => {},
+  }
+  out
+}

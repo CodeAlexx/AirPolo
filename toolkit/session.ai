@@ -1,0 +1,96 @@
+// Restart-safe AirPolo pane/tab session document.
+module airpolo.toolkit.session
+
+import std.files as files
+import std.json as json
+
+pub fn schema_version() -> u64 effects {} { 1 }
+
+pub type Pane = struct { active: u64, tabs: array<string> }
+pub type Session = struct { version: u64, layout: u64, focus: u64, panes: array<Pane> }
+
+pub fn empty() -> Session effects {alloc} {
+  Session {version: schema_version(), layout: 0, focus: 0, panes: array.new()}
+}
+
+fn get_u64(doc: ref<json.Document>, object: u64, key: str, fallback: u64) -> u64 effects {alloc} {
+  match json.get(doc, object, key) {
+    some(value) => match json.as_u64(doc, value) { some(found) => found, none => fallback },
+    none => fallback,
+  }
+}
+
+pub fn load(path_value: str) -> option<Session> effects {alloc, fs.read, fs.meta} {
+  let body: string = match files.read_text(path_value) { ok(value) => value, err(_) => { return option.none() } }
+  var doc: json.Document = match json.parse(str.view(body)) { ok(value) => value, err(_) => { return option.none() } }
+  let root: u64 = json.root()
+  if get_u64(doc, root, "version", 0) != schema_version() { return option.none() }
+  let panes_index: u64 = match json.get(doc, root, "panes") { some(value) => value, none => { return option.none() } }
+  let pane_count: u64 = match json.len(doc, panes_index) { some(value) => value, none => { return option.none() } }
+  if pane_count != 4 { return option.none() }
+  var panes: array<Pane> = array.new()
+  var p: u64 = 0
+  loop {
+    if p >= pane_count { break }
+    let pane_index: u64 = match json.at(doc, panes_index, p) { some(value) => value, none => { return option.none() } }
+    let tabs_index: u64 = match json.get(doc, pane_index, "tabs") { some(value) => value, none => { return option.none() } }
+    let tab_count: u64 = match json.len(doc, tabs_index) { some(value) => value, none => { return option.none() } }
+    if tab_count == 0 or tab_count > 32 { return option.none() }
+    var tabs: array<string> = array.new()
+    var t: u64 = 0
+    loop {
+      if t >= tab_count { break }
+      let tab_index: u64 = match json.at(doc, tabs_index, t) { some(value) => value, none => { return option.none() } }
+      match json.as_string(doc, tab_index) {
+        some(value) => { if str.len(str.view(value)) != 0 { array.push(tabs, value) } },
+        none => {},
+      }
+      t = t + 1
+    }
+    if array.len(tabs) == 0 { return option.none() }
+    var active: u64 = get_u64(doc, pane_index, "active", 0)
+    if active >= array.len(tabs) { active = 0 }
+    array.push(panes, Pane {active: active, tabs: tabs})
+    p = p + 1
+  }
+  var layout: u64 = get_u64(doc, root, "layout", 0)
+  if layout > 3 { layout = 0 }
+  var focus: u64 = get_u64(doc, root, "focus", 0)
+  let visible: u64 = if layout == 3 { 4 } else if layout == 0 { 1 } else { 2 }
+  if focus >= visible { focus = 0 }
+  option.some(Session {version: schema_version(), layout: layout, focus: focus, panes: panes})
+}
+
+pub fn save(path_value: str, state: ref<Session>) -> bool effects {alloc, fs.write} {
+  var body: string = string.copy("{\n  \"version\": ")
+  let version: i64 = cast.wrap(state.version)
+  string.append(body, str.view(string.from_int(version)))
+  string.append(body, ",\n  \"layout\": ")
+  let layout: i64 = cast.wrap(state.layout)
+  string.append(body, str.view(string.from_int(layout)))
+  string.append(body, ",\n  \"focus\": ")
+  let focus: i64 = cast.wrap(state.focus)
+  string.append(body, str.view(string.from_int(focus)))
+  string.append(body, ",\n  \"panes\": [\n")
+  var p: u64 = 0
+  loop {
+    if p >= array.len(struct.borrow(state, field=panes)) { break }
+    if p != 0 { string.append(body, ",\n") }
+    let pane: ref<Pane> = array.borrow(struct.borrow(state, field=panes), p)
+    string.append(body, "    {\"active\": ")
+    let active: i64 = cast.wrap(pane.active)
+    string.append(body, str.view(string.from_int(active)))
+    string.append(body, ", \"tabs\": [")
+    var t: u64 = 0
+    loop {
+      if t >= array.len(struct.borrow(pane, field=tabs)) { break }
+      if t != 0 { string.append(body, ", ") }
+      string.append(body, str.view(json.quote(str.view(array.borrow(struct.borrow(pane, field=tabs), t)))))
+      t = t + 1
+    }
+    string.append(body, "]}")
+    p = p + 1
+  }
+  string.append(body, "\n  ]\n}\n")
+  match files.write_text(path_value, str.view(body)) { ok(_) => true, err(_) => false }
+}

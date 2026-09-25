@@ -1,0 +1,1373 @@
+// AirPolo application state: tabs, navigation history, listing, filtering and selection.
+// Display-free, so the whole browsing model is testable headlessly.
+module airpolo.model
+
+import std.files as files
+import std.path as path
+import std.text as text
+import "../toolkit/fsops.ai" as fsops
+import "../toolkit/mounts.ai" as mounts
+import "../toolkit/settings.ai" as prefs
+import "../toolkit/search.ai" as search
+import "../toolkit/format.ai" as fmt
+import "../toolkit/session.ai" as sessions
+import "../toolkit/theme.ai" as app_theme
+
+pub type Tab = struct {
+  dir: string,
+  entries: array<fsops.Entry>,
+  selected: u64,
+  selection: array<string>,
+  filter: string,
+  history: array<string>,
+  hindex: u64
+}
+
+// Dialog kinds.
+pub fn dialog_none() -> u64 effects {} { 0 }
+pub fn dialog_properties() -> u64 effects {} { 1 }
+pub fn dialog_checksums() -> u64 effects {} { 2 }
+pub fn dialog_archive() -> u64 effects {} { 3 }
+pub fn dialog_confirm_delete() -> u64 effects {} { 4 }
+pub fn dialog_rename() -> u64 effects {} { 5 }
+pub fn dialog_extract() -> u64 effects {} { 6 }
+pub fn dialog_browse() -> u64 effects {} { 7 }
+pub fn dialog_actions() -> u64 effects {} { 8 }
+pub fn dialog_permissions() -> u64 effects {} { 9 }
+pub fn dialog_pdf_password() -> u64 effects {} { 10 }
+pub fn dialog_confirm_permanent_delete() -> u64 effects {} { 11 }
+pub fn dialog_settings() -> u64 effects {} { 12 }
+
+pub type State = struct {
+  tabs: array<Tab>,
+  active: u64,
+  show_hidden: bool,
+  sort_mode: u64,
+  view_mode: u64,          // 0 list, 1 icons
+  clipboard: array<string>,
+  clip_cut: bool,
+  message: string,
+  dialog: u64,
+  dialog_title: string,
+  dialog_text: string,
+  dialog_value: string,
+  dialog_path: string,
+  busy: bool,
+  progress: u64,
+  total: u64,
+  scale: u64,
+  other_tabs: array<Tab>,
+  other_active: u64,
+  focus: u64,
+  dual: bool,
+  layout: u64,
+  pdf_password_add: bool,
+  tabs_c: array<Tab>,
+  active_c: u64,
+  tabs_d: array<Tab>,
+  active_d: u64,
+  bookmarks: array<string>,
+  mounts: array<mounts.Mount>,
+  settings_path: string,
+  session_path: string,
+  run_dir: string,
+  job_running: bool,
+  job_done: u64,
+  job_total: u64,
+  job_message: string,
+  job_signal: string,
+  job_progress: string,
+  search_active: bool
+  ,theme_background: u64
+  ,theme_accent: u64
+  ,settings_background: u64
+  ,settings_accent: u64
+  ,settings_original_background: u64
+  ,settings_original_accent: u64
+}
+
+fn home_dir() -> string effects {alloc, env} {
+  match env.get("HOME") {
+    some(value) => string.copy(value),
+    none => string.copy("/"),
+  }
+}
+
+// Expand a leading ~ and make a path absolute against `base`.
+pub fn resolve_dir(target: str, base: str) -> string effects {alloc, env} {
+  var expanded: string = string.copy(target)
+  if str.starts_with(target, "~") {
+    var rest: string = string.copy(str.slice(target, 1, str.len(target)))
+    var home: string = home_dir()
+    string.append(home, str.view(rest))
+    expanded = home
+  }
+  if str.len(str.view(expanded)) == 0 { return string.copy(base) }
+  if path.is_absolute(str.view(expanded)) { return string.copy(str.view(path.normalize(str.view(expanded)))) }
+  let joined: string = path.join(base, str.view(expanded))
+  string.copy(str.view(path.normalize(str.view(joined))))
+}
+
+pub fn start(dir: str, settings_path: str) -> State effects {alloc, env, fs.meta, fs.read} {
+  var loaded: prefs.Settings = prefs.load(settings_path)
+  var state: State = State {
+    tabs: array.new(), active: 0, show_hidden: loaded.show_hidden, sort_mode: loaded.sort_mode,
+    view_mode: loaded.view_mode, clipboard: array.new(), clip_cut: false, message: string.new(),
+    dialog: 0, dialog_title: string.new(), dialog_text: string.new(),
+    dialog_value: string.new(), dialog_path: string.new(), busy: false, progress: 0, total: 0,
+    scale: 1, other_tabs: array.new(), other_active: 0, focus: 0,
+    dual: loaded.layout != 0, layout: loaded.layout, pdf_password_add: true,
+    tabs_c: array.new(), active_c: 0, tabs_d: array.new(), active_d: 0,
+    bookmarks: struct.replace(loaded, array.new(), field=bookmarks), mounts: mounts.list("/proc/mounts"),
+    settings_path: string.copy(settings_path),
+    session_path: path.join(str.view(path.dirname(settings_path)), "session.json"), run_dir: string.new(),
+    job_running: false, job_done: 0, job_total: 0, job_message: string.new(),
+    job_signal: string.new(), job_progress: string.new(), search_active: false,
+    theme_background: loaded.theme_background, theme_accent: loaded.theme_accent,
+    settings_background: loaded.theme_background, settings_accent: loaded.theme_accent,
+    settings_original_background: loaded.theme_background, settings_original_accent: loaded.theme_accent
+  }
+  var start_dir: string = resolve_dir(dir, str.view(home_dir()))
+  var tab: Tab = Tab {
+    dir: string.copy(str.view(start_dir)), entries: array.new(), selected: 0, selection: array.new(), filter: string.new(),
+    history: array.new(), hindex: 0
+  }
+  array.push(tab.history, string.copy(str.view(start_dir)))
+  array.push(state.tabs, tab)
+  var second: Tab = Tab {
+    dir: string.copy(str.view(home_dir())), entries: array.new(), selected: 0, selection: array.new(), filter: string.new(),
+    history: array.new(), hindex: 0
+  }
+  array.push(second.history, string.copy(str.view(home_dir())))
+  array.push(state.other_tabs, second)
+  refresh(state)
+  // The second pane starts at home; list it now so dual view is never blank.
+  let second_entries: array<fsops.Entry> = fsops.list_entries(str.view(home_dir()), state.show_hidden, state.sort_mode)
+  let _old_second: array<fsops.Entry> = ref.swap(struct.borrow(array.borrow(struct.borrow(state, field=other_tabs), 0), field=entries), second_entries)
+  state
+}
+
+// Persist the parts of the state that belong in the user's settings file.
+pub fn save(state: ref<State>) -> unit effects {alloc, env, fs.read, fs.write, fs.meta} {
+  var snapshot: prefs.Settings = prefs.defaults()
+  struct.set(snapshot, state.show_hidden, field=show_hidden)
+  struct.set(snapshot, state.sort_mode, field=sort_mode)
+  struct.set(snapshot, state.view_mode, field=view_mode)
+  struct.set(snapshot, state.layout, field=layout)
+  struct.set(snapshot, state.theme_background, field=theme_background)
+  struct.set(snapshot, state.theme_accent, field=theme_accent)
+  let _bookmarks: array<string> = ref.swap(struct.borrow(snapshot, field=bookmarks), copy_strings(struct.borrow(state, field=bookmarks)))
+  prefs.save(str.view(state.settings_path), snapshot)
+  ()
+}
+
+pub fn open_settings(state: ref<State>) -> unit effects {alloc} {
+  struct.set(state, state.theme_background, field=settings_original_background)
+  struct.set(state, state.theme_accent, field=settings_original_accent)
+  struct.set(state, state.theme_background, field=settings_background)
+  struct.set(state, state.theme_accent, field=settings_accent)
+  let _title: string = struct.replace(state, string.copy("Appearance"), field=dialog_title)
+  struct.set(state, dialog_settings(), field=dialog)
+  ()
+}
+
+pub fn set_settings_channel(state: ref<State>, target: u64, channel: u64, value: u64) -> unit effects {} {
+  if target == 0 {
+    let changed: u64 = app_theme.with_channel(state.settings_background, channel, value)
+    struct.set(state, changed, field=settings_background)
+    struct.set(state, changed, field=theme_background)
+  } else {
+    let changed: u64 = app_theme.with_channel(state.settings_accent, channel, value)
+    struct.set(state, changed, field=settings_accent)
+    struct.set(state, changed, field=theme_accent)
+  }
+  ()
+}
+
+pub fn set_settings_preset(state: ref<State>, index: u64) -> unit effects {} {
+  let background: u64 = app_theme.preset_background(index)
+  let accent: u64 = app_theme.preset_accent(index)
+  struct.set(state, background, field=settings_background)
+  struct.set(state, accent, field=settings_accent)
+  ()
+}
+
+pub fn set_settings_accent(state: ref<State>, index: u64) -> unit effects {} {
+  struct.set(state, app_theme.accent_choice(index), field=settings_accent)
+  ()
+}
+
+pub fn set_settings_background(state: ref<State>, index: u64) -> unit effects {} {
+  struct.set(state, app_theme.background_choice(index), field=settings_background)
+  ()
+}
+
+pub fn set_settings_theme(state: ref<State>, index: u64) -> unit effects {} {
+  struct.set(state, app_theme.source_theme_background(index), field=settings_background)
+  struct.set(state, app_theme.source_theme_accent(index), field=settings_accent)
+  ()
+}
+
+pub fn preview_settings(state: ref<State>) -> unit effects {} {
+  struct.set(state, state.settings_background, field=theme_background)
+  struct.set(state, state.settings_accent, field=theme_accent)
+  ()
+}
+
+pub fn revert_settings(state: ref<State>) -> unit effects {} {
+  struct.set(state, state.settings_original_background, field=settings_background)
+  struct.set(state, state.settings_original_accent, field=settings_accent)
+  struct.set(state, state.settings_original_background, field=theme_background)
+  struct.set(state, state.settings_original_accent, field=theme_accent)
+  ()
+}
+
+pub fn cancel_settings(state: ref<State>) -> unit effects {} {
+  struct.set(state, state.settings_original_background, field=theme_background)
+  struct.set(state, state.settings_original_accent, field=theme_accent)
+  struct.set(state, dialog_none(), field=dialog)
+  ()
+}
+
+pub fn apply_settings(state: ref<State>) -> unit effects {} {
+  struct.set(state, state.settings_background, field=theme_background)
+  struct.set(state, state.settings_accent, field=theme_accent)
+  struct.set(state, dialog_none(), field=dialog)
+  ()
+}
+
+fn session_pane(tabs: ref<array<Tab>>, active_value: u64) -> sessions.Pane effects {alloc, env} {
+  var paths: array<string> = array.new()
+  var i: u64 = 0
+  loop {
+    if i >= array.len(tabs) { break }
+    array.push(paths, string.copy(array.borrow(tabs, i).dir))
+    i = i + 1
+  }
+  if array.len(paths) == 0 { array.push(paths, home_dir()) }
+  var active: u64 = active_value
+  if active >= array.len(paths) { active = 0 }
+  sessions.Pane {active: active, tabs: paths}
+}
+
+// Save the restart state separately from preferences: four pane tab lists, active tabs,
+// layout and focus. This mirrors Polo's session boundary without making paths preferences.
+pub fn save_session(state: ref<State>) -> bool effects {alloc, env, fs.write} {
+  var panes: array<sessions.Pane> = array.new()
+  array.push(panes, session_pane(struct.borrow(state, field=tabs), state.active))
+  array.push(panes, session_pane(struct.borrow(state, field=other_tabs), state.other_active))
+  array.push(panes, session_pane(struct.borrow(state, field=tabs_c), state.active_c))
+  array.push(panes, session_pane(struct.borrow(state, field=tabs_d), state.active_d))
+  var snapshot: sessions.Session = sessions.Session {
+    version: sessions.schema_version(), layout: state.layout, focus: state.focus, panes: panes
+  }
+  sessions.save(str.view(state.session_path), snapshot)
+}
+
+fn restored_tabs(saved: ref<sessions.Pane>, show_hidden: bool, sort_mode: u64) -> array<Tab> effects {alloc, env, fs.meta} {
+  var out: array<Tab> = array.new()
+  var i: u64 = 0
+  loop {
+    if i >= array.len(struct.borrow(saved, field=tabs)) { break }
+    let candidate: str = str.view(array.borrow(struct.borrow(saved, field=tabs), i))
+    let valid: bool = match files.is_dir(candidate) { ok(value) => value, err(_) => false }
+    if valid {
+      var history: array<string> = array.new()
+      array.push(history, string.copy(candidate))
+      array.push(out, Tab {
+        dir: string.copy(candidate), entries: fsops.list_entries(candidate, show_hidden, sort_mode),
+        selected: 0, selection: array.new(), filter: string.new(), history: history, hindex: 0
+      })
+    }
+    i = i + 1
+  }
+  if array.len(out) == 0 {
+    let fallback: string = home_dir()
+    var history: array<string> = array.new()
+    array.push(history, string.copy(str.view(fallback)))
+    array.push(out, Tab {
+      dir: string.copy(str.view(fallback)), entries: fsops.list_entries(str.view(fallback), show_hidden, sort_mode),
+      selected: 0, selection: array.new(), filter: string.new(), history: history, hindex: 0
+    })
+  }
+  out
+}
+
+type RestoredPane = struct {active: u64, tabs: array<Tab>}
+
+fn restored_pane(snapshot: ref<sessions.Session>, index: u64, show_hidden: bool, sort_mode: u64) -> RestoredPane effects {alloc, env, fs.meta} {
+  let saved: ref<sessions.Pane> = array.borrow(struct.borrow(snapshot, field=panes), index)
+  var tabs: array<Tab> = restored_tabs(saved, show_hidden, sort_mode)
+  let active: u64 = if saved.active < array.len(tabs) { saved.active } else { 0 }
+  RestoredPane {active: active, tabs: tabs}
+}
+
+// Restore only valid directories and fail closed on malformed/unknown session documents.
+pub fn restore_session(state: ref<State>) -> bool effects {alloc, env, fs.read, fs.meta} {
+  var snapshot: sessions.Session = match sessions.load(str.view(state.session_path)) {
+    some(value) => value,
+    none => { return false },
+  }
+  var pane0: RestoredPane = restored_pane(snapshot, 0, state.show_hidden, state.sort_mode)
+  var pane1: RestoredPane = restored_pane(snapshot, 1, state.show_hidden, state.sort_mode)
+  var pane2: RestoredPane = restored_pane(snapshot, 2, state.show_hidden, state.sort_mode)
+  var pane3: RestoredPane = restored_pane(snapshot, 3, state.show_hidden, state.sort_mode)
+  let active0: u64 = pane0.active
+  let active1: u64 = pane1.active
+  let active2: u64 = pane2.active
+  let active3: u64 = pane3.active
+  let tabs0: array<Tab> = ref.swap(struct.borrow(pane0, field=tabs), array.new())
+  let tabs1: array<Tab> = ref.swap(struct.borrow(pane1, field=tabs), array.new())
+  let tabs2: array<Tab> = ref.swap(struct.borrow(pane2, field=tabs), array.new())
+  let tabs3: array<Tab> = ref.swap(struct.borrow(pane3, field=tabs), array.new())
+  let _old0: array<Tab> = ref.swap(struct.borrow(state, field=tabs), tabs0)
+  let _old1: array<Tab> = ref.swap(struct.borrow(state, field=other_tabs), tabs1)
+  let _old2: array<Tab> = ref.swap(struct.borrow(state, field=tabs_c), tabs2)
+  let _old3: array<Tab> = ref.swap(struct.borrow(state, field=tabs_d), tabs3)
+  struct.set(state, active0, field=active)
+  struct.set(state, active1, field=other_active)
+  struct.set(state, active2, field=active_c)
+  struct.set(state, active3, field=active_d)
+  struct.set(state, snapshot.layout, field=layout)
+  struct.set(state, snapshot.layout != 0, field=dual)
+  struct.set(state, snapshot.focus, field=focus)
+  true
+}
+
+pub fn layout_mode(state: ref<State>) -> u64 effects {} { state.layout }
+
+// Cycle single -> dual vertical -> dual horizontal -> single.
+pub fn cycle_layout(state: ref<State>) -> unit effects {alloc, fs.meta} {
+  var next: u64 = 0
+  if state.layout == 0 { next = 1 } else if state.layout == 1 { next = 2 } else if state.layout == 2 { next = 3 }
+  struct.set(state, next, field=layout)
+  struct.set(state, next != 0, field=dual)
+  if next == 0 { struct.set(state, 0, field=focus) }
+  refresh(state)
+  ()
+}
+
+pub fn set_layout(state: ref<State>, mode: u64) -> unit effects {alloc, fs.meta} {
+  var clamped: u64 = mode
+  if clamped > 3 { clamped = 3 }
+  struct.set(state, clamped, field=layout)
+  struct.set(state, clamped != 0, field=dual)
+  if clamped == 0 { struct.set(state, 0, field=focus) }
+  refresh(state)
+  ()
+}
+
+fn copy_strings(values: ref<array<string>>) -> array<string> effects {alloc} {
+  var out: array<string> = array.new()
+  var i: u64 = 0
+  loop {
+    if i >= array.len(values) { break }
+    array.push(out, string.copy(str.view(array.borrow(values, i))))
+    i = i + 1
+  }
+  out
+}
+
+pub fn other_tab_count(state: ref<State>) -> u64 effects {} { array.len(struct.borrow(state, field=other_tabs)) }
+
+pub fn other_visible(state: ref<State>) -> array<u64> effects {alloc} {
+  var out: array<u64> = array.new()
+  let index: u64 = state.other_active
+  if index >= array.len(struct.borrow(state, field=other_tabs)) { return out }
+  let tab: ref<Tab> = array.borrow(struct.borrow(state, field=other_tabs), index)
+  let needle: string = text.lower_ascii(str.view(struct.borrow(tab, field=filter)))
+  var i: u64 = 0
+  let n: u64 = array.len(struct.borrow(tab, field=entries))
+  loop {
+    if i >= n { break }
+    let name: string = text.lower_ascii(array.borrow(struct.borrow(tab, field=entries), i).name)
+    if str.len(str.view(needle)) == 0 or text.contains(str.view(name), str.view(needle)) {
+      array.push(out, i)
+    }
+    i = i + 1
+  }
+  out
+}
+
+pub fn other_entry_at_visible(state: ref<State>, position: u64) -> option<fsops.Entry> effects {alloc} {
+  var indices: array<u64> = other_visible(state)
+  if position >= array.len(indices) { return option.none() }
+  let index: u64 = state.other_active
+  if index >= array.len(struct.borrow(state, field=other_tabs)) { return option.none() }
+  let entry: ref<fsops.Entry> = array.borrow(struct.borrow(array.borrow(struct.borrow(state, field=other_tabs), index), field=entries), array.get(indices, position))
+  option.some(fsops.Entry {
+    name: string.copy(entry.name), path: string.copy(entry.path), is_dir: entry.is_dir,
+    is_link: entry.is_link, size: entry.size, mtime_ns: entry.mtime_ns, kind: string.copy(entry.kind)
+  })
+}
+
+pub fn refresh_other(state: ref<State>) -> unit effects {alloc, fs.meta} {
+  let index: u64 = state.other_active
+  if index >= array.len(struct.borrow(state, field=other_tabs)) { return () }
+  let dir: string = string.copy(struct.borrow(array.borrow(struct.borrow(state, field=other_tabs), index), field=dir))
+  let entries: array<fsops.Entry> = fsops.list_entries(str.view(dir), state.show_hidden, state.sort_mode)
+  let _old: array<fsops.Entry> = ref.swap(struct.borrow(array.borrow(struct.borrow(state, field=other_tabs), index), field=entries), entries)
+  ()
+}
+
+pub fn toggle_dual(state: ref<State>) -> unit effects {alloc, fs.meta} {
+  struct.set(state, not state.dual, field=dual)
+  refresh_other(state)
+  ()
+}
+
+// Swap the focused and unfocused panes and flip the visual focus.
+pub fn toggle_focus(state: ref<State>) -> unit effects {alloc} {
+  let left: array<Tab> = ref.swap(struct.borrow(state, field=tabs), array.new())
+  let right: array<Tab> = ref.swap(struct.borrow(state, field=other_tabs), left)
+  let _back: array<Tab> = ref.swap(struct.borrow(state, field=tabs), right)
+  let left_active: u64 = state.active
+  let right_active: u64 = state.other_active
+  struct.set(state, right_active, field=active)
+  struct.set(state, left_active, field=other_active)
+  struct.set(state, if state.focus == 0 { 1 } else { 0 }, field=focus)
+  ()
+}
+
+pub fn other_dir(state: ref<State>) -> string effects {alloc} {
+  let index: u64 = state.other_active
+  if index >= array.len(state.other_tabs) { return string.copy("/") }
+  string.copy(struct.borrow(array.borrow(struct.borrow(state, field=other_tabs), index), field=dir))
+}
+
+pub fn add_bookmark(state: ref<State>) -> unit effects {alloc} {
+  let dir: string = current_dir(state)
+  var i: u64 = 0
+  loop {
+    if i >= array.len(struct.borrow(state, field=bookmarks)) { break }
+    if str.eq(str.view(array.borrow(struct.borrow(state, field=bookmarks), i)), str.view(dir)) {
+      set_message(state, "already bookmarked")
+      return ()
+    }
+    i = i + 1
+  }
+  array.push(struct.borrow(state, field=bookmarks), dir)
+  set_message(state, "bookmarked")
+  ()
+}
+
+pub fn bookmark_count(state: ref<State>) -> u64 effects {} { array.len(struct.borrow(state, field=bookmarks)) }
+
+pub fn bookmark_at(state: ref<State>, index: u64) -> option<string> effects {alloc} {
+  if index >= array.len(struct.borrow(state, field=bookmarks)) { return option.none() }
+  option.some(string.copy(str.view(array.borrow(struct.borrow(state, field=bookmarks), index))))
+}
+
+pub fn mount_count(state: ref<State>) -> u64 effects {} { array.len(struct.borrow(state, field=mounts)) }
+
+pub fn mount_at(state: ref<State>, index: u64) -> option<mounts.Mount> effects {alloc} {
+  if index >= array.len(struct.borrow(state, field=mounts)) { return option.none() }
+  let m: ref<mounts.Mount> = array.borrow(struct.borrow(state, field=mounts), index)
+  option.some(mounts.Mount {device: string.copy(m.device), point: string.copy(m.point), fstype: string.copy(m.fstype)})
+}
+
+pub fn current_dir(state: ref<State>) -> string effects {alloc} {
+  string.copy(struct.borrow(array.borrow(struct.borrow(state, field=tabs), state.active), field=dir))
+}
+
+pub fn set_message(state: ref<State>, value: str) -> unit effects {alloc} {
+  let _old: string = struct.replace(state, string.copy(value), field=message)
+  ()
+}
+
+fn set_tab_dir(state: ref<State>, dir: str) -> unit effects {alloc} {
+  let tab: ref<Tab> = array.borrow(struct.borrow(state, field=tabs), state.active)
+  let _old: string = struct.replace(tab, string.copy(dir), field=dir)
+  ()
+}
+
+fn set_tab_entries(state: ref<State>, entries: array<fsops.Entry> own) -> unit effects {alloc} {
+  let tab: ref<Tab> = array.borrow(struct.borrow(state, field=tabs), state.active)
+  let _old: array<fsops.Entry> = ref.swap(struct.borrow(tab, field=entries), entries)
+  struct.set(tab, 0, field=selected)
+  let _selection: array<string> = ref.swap(struct.borrow(tab, field=selection), array.new())
+  ()
+}
+
+// Re-list the current directory.
+pub fn refresh(state: ref<State>) -> unit effects {alloc, fs.meta} {
+  if state.search_active { return () }
+  let dir: string = current_dir(state)
+  let entries: array<fsops.Entry> = fsops.list_entries(str.view(dir), state.show_hidden, state.sort_mode)
+  set_tab_entries(state, entries)
+  ()
+}
+
+// Move to a directory, pushing history.
+pub fn navigate(state: ref<State>, target: str) -> unit effects {alloc, env, fs.meta} {
+  let dir: string = resolve_dir(target, str.view(current_dir(state)))
+  match files.is_dir(str.view(dir)) {
+    ok(value) => {
+      if not value {
+        set_message(state, "not a directory")
+        return ()
+      }
+    },
+    err(_) => {
+      set_message(state, "cannot open")
+      return ()
+    },
+  }
+  let index: u64 = state.active
+  array.push(struct.borrow(array.borrow(struct.borrow(state, field=tabs), index), field=history), string.copy(str.view(dir)))
+  let depth: u64 = array.len(struct.borrow(array.borrow(struct.borrow(state, field=tabs), index), field=history))
+  struct.set(array.borrow(struct.borrow(state, field=tabs), index), depth - 1, field=hindex)
+  set_tab_dir(state, str.view(dir))
+  let _f: string = struct.replace(array.borrow(struct.borrow(state, field=tabs), index), string.new(), field=filter)
+  struct.set(state, false, field=search_active)
+  refresh(state)
+  ()
+}
+
+pub fn back(state: ref<State>) -> unit effects {alloc, fs.meta} {
+  let active: u64 = state.active
+  let index: u64 = struct.get(array.borrow(struct.borrow(state, field=tabs), active), field=hindex)
+  if index == 0 { return () }
+  struct.set(array.borrow(struct.borrow(state, field=tabs), active), index - 1, field=hindex)
+  let dir: string = string.copy(array.borrow(struct.borrow(array.borrow(struct.borrow(state, field=tabs), active), field=history), index - 1))
+  set_tab_dir(state, str.view(dir))
+  struct.set(state, false, field=search_active)
+  refresh(state)
+  ()
+}
+
+pub fn forward(state: ref<State>) -> unit effects {alloc, fs.meta} {
+  let active: u64 = state.active
+  let index: u64 = struct.get(array.borrow(struct.borrow(state, field=tabs), active), field=hindex)
+  let depth: u64 = array.len(struct.borrow(array.borrow(struct.borrow(state, field=tabs), active), field=history))
+  if index + 1 >= depth { return () }
+  struct.set(array.borrow(struct.borrow(state, field=tabs), active), index + 1, field=hindex)
+  let dir: string = string.copy(array.borrow(struct.borrow(array.borrow(struct.borrow(state, field=tabs), active), field=history), index + 1))
+  set_tab_dir(state, str.view(dir))
+  struct.set(state, false, field=search_active)
+  refresh(state)
+  ()
+}
+
+pub fn up(state: ref<State>) -> unit effects {alloc, env, fs.meta} {
+  let dir: string = current_dir(state)
+  let parent: string = path.dirname(str.view(dir))
+  if str.len(str.view(parent)) != 0 { navigate(state, str.view(parent)) }
+  ()
+}
+
+pub fn go_home(state: ref<State>) -> unit effects {alloc, env, fs.meta} {
+  navigate(state, str.view(home_dir()))
+  ()
+}
+
+pub fn toggle_hidden(state: ref<State>) -> unit effects {alloc, fs.meta} {
+  struct.set(state, not state.show_hidden, field=show_hidden)
+  var pane: u64 = 0
+  loop {
+    if pane >= pane_count(state) { break }
+    refresh_pane(state, pane)
+    pane = pane + 1
+  }
+  ()
+}
+
+pub fn set_sort(state: ref<State>, mode: u64) -> unit effects {alloc, fs.meta} {
+  struct.set(state, mode, field=sort_mode)
+  let active: u64 = state.active
+  fsops.sort_entries(struct.borrow(array.borrow(struct.borrow(state, field=tabs), active), field=entries), mode)
+  ()
+}
+
+// Recursive search from the current directory using the filter text; results replace the
+// listing until the user navigates again.
+pub fn search_here(state: ref<State>) -> u64 effects {alloc, fs.meta} {
+  let tab: ref<Tab> = array.borrow(struct.borrow(state, field=tabs), state.active)
+  let needle: string = string.copy(str.view(struct.borrow(tab, field=filter)))
+  if str.len(str.view(needle)) == 0 {
+    set_message(state, "type a name to search for")
+    return 0
+  }
+  let dir: string = current_dir(state)
+  var hits: array<search.Hit> = search.find(str.view(dir), str.view(needle), 200)
+  var entries: array<fsops.Entry> = array.new()
+  var i: u64 = 0
+  loop {
+    if i >= array.len(hits) { break }
+    let hit: ref<search.Hit> = array.borrow(hits, i)
+    array.push(entries, fsops.Entry {
+      name: string.copy(hit.name), path: string.copy(hit.path), is_dir: hit.is_dir,
+      is_link: false, size: 0, mtime_ns: 0, kind: fmt.kind_of(str.view(hit.name), hit.is_dir, false)
+    })
+    i = i + 1
+  }
+  let count: u64 = array.len(entries)
+  set_tab_entries(state, entries)
+  struct.set(state, true, field=search_active)
+  var note: string = string.copy("found ")
+  string.append(note, str.view(string.from_int(count)))
+  string.append(note, " matches for '")
+  string.append(note, str.view(needle))
+  string.append(note, "'")
+  set_message(state, str.view(note))
+  count
+}
+
+pub fn set_filter(state: ref<State>, value: str) -> unit effects {alloc} {
+  let tab: ref<Tab> = array.borrow(struct.borrow(state, field=tabs), state.active)
+  let _old: string = struct.replace(tab, string.copy(value), field=filter)
+  ()
+}
+
+pub fn set_view(state: ref<State>, mode: u64) -> unit effects {} {
+  struct.set(state, mode, field=view_mode)
+  ()
+}
+
+// Indices of entries that pass the current filter, in listing order.
+pub fn visible(state: ref<State>) -> array<u64> effects {alloc} {
+  var out: array<u64> = array.new()
+  let tab: ref<Tab> = array.borrow(struct.borrow(state, field=tabs), state.active)
+  let needle: string = text.lower_ascii(str.view(struct.borrow(tab, field=filter)))
+  var i: u64 = 0
+  let n: u64 = array.len(struct.borrow(tab, field=entries))
+  loop {
+    if i >= n { break }
+    let name: string = text.lower_ascii(array.borrow(struct.borrow(tab, field=entries), i).name)
+    if str.len(str.view(needle)) == 0 or text.contains(str.view(name), str.view(needle)) {
+      array.push(out, i)
+    }
+    i = i + 1
+  }
+  out
+}
+
+pub fn visible_count(state: ref<State>) -> u64 effects {alloc} {
+  var indices: array<u64> = visible(state)
+  array.len(indices)
+}
+
+// The selected entry, or none when the selection is out of range or filtered out.
+pub fn selected_entry(state: ref<State>) -> option<fsops.Entry> effects {alloc} {
+  var indices: array<u64> = visible(state)
+  let position: u64 = struct.get(array.borrow(struct.borrow(state, field=tabs), state.active), field=selected)
+  if position >= array.len(indices) { return option.none() }
+  let entry: ref<fsops.Entry> = array.borrow(struct.borrow(array.borrow(struct.borrow(state, field=tabs), state.active), field=entries), array.get(indices, position))
+  option.some(fsops.Entry {
+    name: string.copy(entry.name), path: string.copy(entry.path), is_dir: entry.is_dir,
+    is_link: entry.is_link, size: entry.size, mtime_ns: entry.mtime_ns, kind: string.copy(entry.kind)
+  })
+}
+
+pub fn set_selected(state: ref<State>, position: u64) -> unit effects {alloc} {
+  let selected: option<fsops.Entry> = entry_at_visible(state, position)
+  let tab: ref<Tab> = array.borrow(struct.borrow(state, field=tabs), state.active)
+  struct.set(tab, position, field=selected)
+  let _old: array<string> = ref.swap(struct.borrow(tab, field=selection), array.new())
+  match selected {
+    some(value) => {
+      var entry: fsops.Entry = value
+      array.push(struct.borrow(tab, field=selection), fsops.path_of(entry))
+    },
+    none => {},
+  }
+  ()
+}
+
+fn selected_entries_in(tabs: ref<array<Tab>>, index: u64) -> array<fsops.Entry> effects {alloc} {
+  var out: array<fsops.Entry> = array.new()
+  if index >= array.len(tabs) { return out }
+  let tab: ref<Tab> = array.borrow(tabs, index)
+  let chosen: ref<array<string>> = struct.borrow(tab, field=selection)
+  var s: u64 = 0
+  loop {
+    if s >= array.len(chosen) { break }
+    let wanted: str = str.view(array.borrow(chosen, s))
+    var i: u64 = 0
+    loop {
+      if i >= array.len(struct.borrow(tab, field=entries)) { break }
+      let entry: ref<fsops.Entry> = array.borrow(struct.borrow(tab, field=entries), i)
+      if str.eq(entry.path, wanted) {
+        array.push(out, fsops.Entry {
+          name: string.copy(entry.name), path: string.copy(entry.path), is_dir: entry.is_dir,
+          is_link: entry.is_link, size: entry.size, mtime_ns: entry.mtime_ns, kind: string.copy(entry.kind)
+        })
+        break
+      }
+      i = i + 1
+    }
+    s = s + 1
+  }
+  out
+}
+
+pub fn selected_entries(state: ref<State>) -> array<fsops.Entry> effects {alloc} {
+  pane_selected_entries(state, state.focus)
+}
+
+pub fn entry_at_visible(state: ref<State>, position: u64) -> option<fsops.Entry> effects {alloc} {
+  var indices: array<u64> = visible(state)
+  if position >= array.len(indices) { return option.none() }
+  let entry: ref<fsops.Entry> = array.borrow(struct.borrow(array.borrow(struct.borrow(state, field=tabs), state.active), field=entries), array.get(indices, position))
+  option.some(fsops.Entry {
+    name: string.copy(entry.name), path: string.copy(entry.path), is_dir: entry.is_dir,
+    is_link: entry.is_link, size: entry.size, mtime_ns: entry.mtime_ns, kind: string.copy(entry.kind)
+  })
+}
+
+// Copy of the entries currently shown by the filter, for batch actions.
+pub fn visible_entries(state: ref<State>) -> array<fsops.Entry> effects {alloc} {
+  var out: array<fsops.Entry> = array.new()
+  var indices: array<u64> = visible(state)
+  let entries: ref<array<fsops.Entry>> = struct.borrow(array.borrow(struct.borrow(state, field=tabs), state.active), field=entries)
+  var i: u64 = 0
+  loop {
+    if i >= array.len(indices) { break }
+    let entry: ref<fsops.Entry> = array.borrow(entries, array.get(indices, i))
+    array.push(out, fsops.Entry {
+      name: string.copy(entry.name), path: string.copy(entry.path), is_dir: entry.is_dir,
+      is_link: entry.is_link, size: entry.size, mtime_ns: entry.mtime_ns, kind: string.copy(entry.kind)
+    })
+    i = i + 1
+  }
+  out
+}
+
+// ── Tabs ────────────────────────────────────────────────────────────────────
+
+pub fn new_tab(state: ref<State>) -> unit effects {alloc, env, fs.meta} {
+  let dir: string = current_dir(state)
+  var tab: Tab = Tab {
+    dir: string.copy(str.view(dir)), entries: array.new(), selected: 0, selection: array.new(),
+    filter: string.new(), history: array.new(), hindex: 0
+  }
+  array.push(tab.history, string.copy(str.view(dir)))
+  array.push(state.tabs, tab)
+  struct.set(state, array.len(state.tabs) - 1, field=active)
+  refresh(state)
+  ()
+}
+
+fn copy_tab(value: ref<Tab>) -> Tab effects {alloc} {
+  var entries: array<fsops.Entry> = array.new()
+  var i: u64 = 0
+  loop {
+    if i >= array.len(struct.borrow(value, field=entries)) { break }
+    let entry: ref<fsops.Entry> = array.borrow(struct.borrow(value, field=entries), i)
+    array.push(entries, fsops.Entry {
+      name: string.copy(entry.name), path: string.copy(entry.path), is_dir: entry.is_dir,
+      is_link: entry.is_link, size: entry.size, mtime_ns: entry.mtime_ns, kind: string.copy(entry.kind)
+    })
+    i = i + 1
+  }
+  var history: array<string> = array.new()
+  i = 0
+  loop {
+    if i >= array.len(struct.borrow(value, field=history)) { break }
+    array.push(history, string.copy(str.view(array.borrow(struct.borrow(value, field=history), i))))
+    i = i + 1
+  }
+  Tab {
+    dir: string.copy(value.dir), entries: entries, selected: value.selected,
+    selection: copy_strings(struct.borrow(value, field=selection)),
+    filter: string.copy(value.filter), history: history, hindex: value.hindex
+  }
+}
+
+pub fn close_tab(state: ref<State>) -> unit effects {alloc, fs.meta} {
+  if array.len(state.tabs) <= 1 { return () }
+  var kept: array<Tab> = array.new()
+  var i: u64 = 0
+  loop {
+    if i >= array.len(state.tabs) { break }
+    if i != state.active { array.push(kept, copy_tab(array.borrow(state.tabs, i))) }
+    i = i + 1
+  }
+  let _old: array<Tab> = ref.swap(state.tabs, kept)
+  var next: u64 = state.active
+  if next >= array.len(state.tabs) { next = array.len(state.tabs) - 1 }
+  struct.set(state, next, field=active)
+  refresh(state)
+  ()
+}
+
+pub fn switch_tab(state: ref<State>, index: u64) -> unit effects {alloc, fs.meta} {
+  if index >= array.len(state.tabs) { return () }
+  struct.set(state, index, field=active)
+  refresh(state)
+  ()
+}
+
+pub fn tab_count(state: ref<State>) -> u64 effects {} { array.len(state.tabs) }
+
+pub fn set_run_dir(state: ref<State>, value: str) -> unit effects {alloc} {
+  let _old: string = struct.replace(state, string.copy(value), field=run_dir)
+  ()
+}
+
+pub fn start_job(state: ref<State>, signal: str, progress: str, total: u64) -> unit effects {alloc} {
+  struct.set(state, true, field=job_running)
+  struct.set(state, 0, field=job_done)
+  struct.set(state, total, field=job_total)
+  let _s: string = struct.replace(state, string.copy(signal), field=job_signal)
+  let _p: string = struct.replace(state, string.copy(progress), field=job_progress)
+  let _m: string = struct.replace(state, string.copy("working"), field=job_message)
+  ()
+}
+
+// Read the worker's tab-separated progress document into the job fields.
+pub fn poll_job(state: ref<State>) -> unit effects {alloc, fs.read, fs.meta} {
+  if not state.job_running { return () }
+  match files.read_text(str.view(state.job_progress)) {
+    ok(body) => {
+      var fields: array<string> = text.split(str.view(body), "\t")
+      if array.len(fields) >= 3 {
+        let done: u64 = match text.parse_u64(str.view(array.borrow(fields, 0))) { some(v) => v, none => 0 }
+        let total: u64 = match text.parse_u64(str.view(array.borrow(fields, 1))) { some(v) => v, none => 0 }
+        struct.set(state, done, field=job_done)
+        struct.set(state, total, field=job_total)
+        let _m: string = struct.replace(state, string.copy(text.trim_newline(str.view(array.borrow(fields, 2)))), field=job_message)
+      }
+    },
+    err(_) => {},
+  }
+  ()
+}
+
+pub fn finish_job(state: ref<State>, message: str) -> unit effects {alloc} {
+  struct.set(state, false, field=job_running)
+  let _m: string = struct.replace(state, string.copy(message), field=job_message)
+  ()
+}
+
+pub fn request_stop(state: ref<State>) -> unit effects {alloc, fs.write} {
+  if not state.job_running { return () }
+  if str.len(str.view(state.job_signal)) == 0 { return () }
+  let _wrote: result<unit, fs.error> = files.write_text(str.view(state.job_signal), "1")
+  let _m: string = struct.replace(state, string.copy("stopping"), field=job_message)
+  ()
+}
+
+pub fn set_scale(state: ref<State>, value: u64) -> unit effects {} {
+  struct.set(state, value, field=scale)
+  ()
+}
+
+// ── Clipboard ───────────────────────────────────────────────────────────────
+
+pub fn copy_selection(state: ref<State>, cut: bool) -> unit effects {alloc} {
+  var entries: array<fsops.Entry> = selected_entries(state)
+  if array.len(entries) == 0 { return () }
+  let old: array<string> = ref.swap(struct.borrow(state, field=clipboard), array.new())
+  var i: u64 = 0
+  loop {
+    if i >= array.len(entries) { break }
+    array.push(struct.borrow(state, field=clipboard), fsops.path_of(array.borrow(entries, i)))
+    i = i + 1
+  }
+  struct.set(state, cut, field=clip_cut)
+  var note: string = string.copy("copied ")
+  string.append(note, str.view(string.from_int(array.len(entries))))
+  string.append(note, " items")
+  set_message(state, str.view(note))
+  ()
+}
+
+pub fn clipboard_count(state: ref<State>) -> u64 effects {} { array.len(state.clipboard) }
+
+// ── Generic panes (single, dual and quad layouts) ────────────────────────────
+// Pane 0 uses `tabs`, pane 1 `other_tabs`, and quad adds `tabs_c`/`tabs_d`. These
+// accessors let the view and actions treat any pane uniformly.
+
+pub fn pane_count(state: ref<State>) -> u64 effects {} {
+  if state.layout == 3 { 4 } else if state.layout != 0 { 2 } else { 1 }
+}
+
+fn visible_in(tabs: ref<array<Tab>>, index: u64) -> array<u64> effects {alloc} {
+  var out: array<u64> = array.new()
+  if index >= array.len(tabs) { return out }
+  let tab: ref<Tab> = array.borrow(tabs, index)
+  let needle: string = text.lower_ascii(str.view(struct.borrow(tab, field=filter)))
+  var i: u64 = 0
+  let n: u64 = array.len(struct.borrow(tab, field=entries))
+  loop {
+    if i >= n { break }
+    let name: string = text.lower_ascii(array.borrow(struct.borrow(tab, field=entries), i).name)
+    if str.len(str.view(needle)) == 0 or text.contains(str.view(name), str.view(needle)) {
+      array.push(out, i)
+    }
+    i = i + 1
+  }
+  out
+}
+
+fn entry_in(tabs: ref<array<Tab>>, index: u64, position: u64) -> option<fsops.Entry> effects {alloc} {
+  var indices: array<u64> = visible_in(tabs, index)
+  if position >= array.len(indices) { return option.none() }
+  if index >= array.len(tabs) { return option.none() }
+  let entry: ref<fsops.Entry> = array.borrow(struct.borrow(array.borrow(tabs, index), field=entries), array.get(indices, position))
+  option.some(fsops.Entry {
+    name: string.copy(entry.name), path: string.copy(entry.path), is_dir: entry.is_dir,
+    is_link: entry.is_link, size: entry.size, mtime_ns: entry.mtime_ns, kind: string.copy(entry.kind)
+  })
+}
+
+fn selected_entry_in(tabs: ref<array<Tab>>, index: u64) -> option<fsops.Entry> effects {alloc} {
+  var indices: array<u64> = visible_in(tabs, index)
+  if index >= array.len(tabs) { return option.none() }
+  let position: u64 = struct.get(array.borrow(tabs, index), field=selected)
+  entry_in(tabs, index, position)
+}
+
+fn navigate_in(tabs: ref<array<Tab>>, index: u64, target: str, show_hidden: bool, sort_mode: u64) -> unit effects {alloc, fs.meta} {
+  if index >= array.len(tabs) { return () }
+  let tab: ref<Tab> = array.borrow(tabs, index)
+  let history_index: u64 = tab.hindex
+  if history_index + 1 < array.len(struct.borrow(tab, field=history)) {
+    var kept: array<string> = array.new()
+    var h: u64 = 0
+    loop {
+      if h > history_index { break }
+      array.push(kept, string.copy(str.view(array.borrow(struct.borrow(tab, field=history), h))))
+      h = h + 1
+    }
+    let _history: array<string> = ref.swap(struct.borrow(tab, field=history), kept)
+  }
+  let dir: string = string.copy(target)
+  let _old: string = ref.swap(struct.borrow(tab, field=dir), dir)
+  struct.set(tab, 0, field=selected)
+  let _selection: array<string> = ref.swap(struct.borrow(tab, field=selection), array.new())
+  let entries: array<fsops.Entry> = fsops.list_entries(target, show_hidden, sort_mode)
+  let _e: array<fsops.Entry> = ref.swap(struct.borrow(tab, field=entries), entries)
+  array.push(struct.borrow(tab, field=history), string.copy(target))
+  struct.set(tab, array.len(struct.borrow(tab, field=history)) - 1, field=hindex)
+  ()
+}
+
+fn refresh_in(tabs: ref<array<Tab>>, index: u64, show_hidden: bool, sort_mode: u64) -> unit effects {alloc, fs.meta} {
+  if index >= array.len(tabs) { return () }
+  let dir: string = string.copy(struct.borrow(array.borrow(tabs, index), field=dir))
+  let entries: array<fsops.Entry> = fsops.list_entries(str.view(dir), show_hidden, sort_mode)
+  let _old: array<fsops.Entry> = ref.swap(struct.borrow(array.borrow(tabs, index), field=entries), entries)
+  ()
+}
+
+fn history_move_in(tabs: ref<array<Tab>>, index: u64, forward_value: bool, show_hidden: bool, sort_mode: u64) -> unit effects {alloc, fs.meta} {
+  if index >= array.len(tabs) { return () }
+  let current: u64 = array.borrow(tabs, index).hindex
+  let depth: u64 = array.len(struct.borrow(array.borrow(tabs, index), field=history))
+  var next: u64 = current
+  if forward_value {
+    if current + 1 >= depth { return () }
+    next = current + 1
+  } else {
+    if current == 0 { return () }
+    next = current - 1
+  }
+  let directory: string = string.copy(str.view(array.borrow(struct.borrow(array.borrow(tabs, index), field=history), next)))
+  let tab: ref<Tab> = array.borrow(tabs, index)
+  let _dir: string = ref.swap(struct.borrow(tab, field=dir), directory)
+  struct.set(tab, next, field=hindex)
+  struct.set(tab, 0, field=selected)
+  let _selection: array<string> = ref.swap(struct.borrow(tab, field=selection), array.new())
+  refresh_in(tabs, index, show_hidden, sort_mode)
+  ()
+}
+
+pub fn pane_back(state: ref<State>, pane: u64) -> unit effects {alloc, fs.meta} {
+  if pane == 1 { history_move_in(struct.borrow(state, field=other_tabs), state.other_active, false, state.show_hidden, state.sort_mode)
+    return () }
+  if pane == 2 { history_move_in(struct.borrow(state, field=tabs_c), state.active_c, false, state.show_hidden, state.sort_mode)
+    return () }
+  if pane == 3 { history_move_in(struct.borrow(state, field=tabs_d), state.active_d, false, state.show_hidden, state.sort_mode)
+    return () }
+  history_move_in(struct.borrow(state, field=tabs), state.active, false, state.show_hidden, state.sort_mode)
+  ()
+}
+
+pub fn pane_forward(state: ref<State>, pane: u64) -> unit effects {alloc, fs.meta} {
+  if pane == 1 { history_move_in(struct.borrow(state, field=other_tabs), state.other_active, true, state.show_hidden, state.sort_mode)
+    return () }
+  if pane == 2 { history_move_in(struct.borrow(state, field=tabs_c), state.active_c, true, state.show_hidden, state.sort_mode)
+    return () }
+  if pane == 3 { history_move_in(struct.borrow(state, field=tabs_d), state.active_d, true, state.show_hidden, state.sort_mode)
+    return () }
+  history_move_in(struct.borrow(state, field=tabs), state.active, true, state.show_hidden, state.sort_mode)
+  ()
+}
+
+pub fn pane_up(state: ref<State>, pane: u64) -> unit effects {alloc, fs.meta} {
+  let directory: string = pane_dir(state, pane)
+  let parent: string = path.dirname(str.view(directory))
+  if str.len(str.view(parent)) != 0 { pane_navigate(state, pane, str.view(parent)) }
+  ()
+}
+
+pub fn pane_home(state: ref<State>, pane: u64) -> unit effects {alloc, env, fs.meta} {
+  pane_navigate(state, pane, str.view(home_dir()))
+  ()
+}
+
+pub fn pane_active(state: ref<State>, pane: u64) -> u64 effects {} {
+  if pane == 1 { return state.other_active }
+  if pane == 2 { return state.active_c }
+  if pane == 3 { return state.active_d }
+  state.active
+}
+
+fn tab_count_in(tabs: ref<array<Tab>>) -> u64 effects {} { array.len(tabs) }
+
+pub fn pane_tab_count(state: ref<State>, pane: u64) -> u64 effects {} {
+  if pane == 1 { return tab_count_in(struct.borrow(state, field=other_tabs)) }
+  if pane == 2 { return tab_count_in(struct.borrow(state, field=tabs_c)) }
+  if pane == 3 { return tab_count_in(struct.borrow(state, field=tabs_d)) }
+  tab_count_in(struct.borrow(state, field=tabs))
+}
+
+fn new_tab_in(tabs: ref<array<Tab>>, index: u64, show_hidden: bool, sort_mode: u64) -> u64 effects {alloc, fs.meta} {
+  if index >= array.len(tabs) { return index }
+  let dir: string = string.copy(struct.borrow(array.borrow(tabs, index), field=dir))
+  var tab: Tab = Tab {
+    dir: string.copy(str.view(dir)), entries: array.new(), selected: 0, selection: array.new(),
+    filter: string.new(), history: array.new(), hindex: 0
+  }
+  array.push(tab.history, string.copy(str.view(dir)))
+  array.push(tabs, tab)
+  let next: u64 = array.len(tabs) - 1
+  refresh_in(tabs, next, show_hidden, sort_mode)
+  next
+}
+
+pub fn pane_new_tab(state: ref<State>, pane: u64) -> unit effects {alloc, fs.meta} {
+  if pane == 1 { let next: u64 = new_tab_in(struct.borrow(state, field=other_tabs), state.other_active, state.show_hidden, state.sort_mode)
+    struct.set(state, next, field=other_active)
+    return () }
+  if pane == 2 { let next: u64 = new_tab_in(struct.borrow(state, field=tabs_c), state.active_c, state.show_hidden, state.sort_mode)
+    struct.set(state, next, field=active_c)
+    return () }
+  if pane == 3 { let next: u64 = new_tab_in(struct.borrow(state, field=tabs_d), state.active_d, state.show_hidden, state.sort_mode)
+    struct.set(state, next, field=active_d)
+    return () }
+  let next: u64 = new_tab_in(struct.borrow(state, field=tabs), state.active, state.show_hidden, state.sort_mode)
+  struct.set(state, next, field=active)
+  ()
+}
+
+fn close_tab_in(tabs: ref<array<Tab>>, index: u64) -> u64 effects {alloc} {
+  if array.len(tabs) <= 1 or index >= array.len(tabs) { return index }
+  var kept: array<Tab> = array.new()
+  var i: u64 = 0
+  loop {
+    if i >= array.len(tabs) { break }
+    if i != index { array.push(kept, copy_tab(array.borrow(tabs, i))) }
+    i = i + 1
+  }
+  let _old: array<Tab> = ref.swap(tabs, kept)
+  if index >= array.len(tabs) { array.len(tabs) - 1 } else { index }
+}
+
+pub fn pane_close_tab(state: ref<State>, pane: u64) -> unit effects {alloc} {
+  if pane == 1 { let next: u64 = close_tab_in(struct.borrow(state, field=other_tabs), state.other_active)
+    struct.set(state, next, field=other_active)
+    return () }
+  if pane == 2 { let next: u64 = close_tab_in(struct.borrow(state, field=tabs_c), state.active_c)
+    struct.set(state, next, field=active_c)
+    return () }
+  if pane == 3 { let next: u64 = close_tab_in(struct.borrow(state, field=tabs_d), state.active_d)
+    struct.set(state, next, field=active_d)
+    return () }
+  let next: u64 = close_tab_in(struct.borrow(state, field=tabs), state.active)
+  struct.set(state, next, field=active)
+  ()
+}
+
+pub fn pane_switch_tab(state: ref<State>, pane: u64, index: u64) -> unit effects {} {
+  if index >= pane_tab_count(state, pane) { return () }
+  set_pane_active(state, pane, index)
+  ()
+}
+
+pub fn pane_tab_dir(state: ref<State>, pane: u64, index: u64) -> string effects {alloc} {
+  if pane == 1 and index < array.len(struct.borrow(state, field=other_tabs)) { return string.copy(array.borrow(struct.borrow(state, field=other_tabs), index).dir) }
+  if pane == 2 and index < array.len(struct.borrow(state, field=tabs_c)) { return string.copy(array.borrow(struct.borrow(state, field=tabs_c), index).dir) }
+  if pane == 3 and index < array.len(struct.borrow(state, field=tabs_d)) { return string.copy(array.borrow(struct.borrow(state, field=tabs_d), index).dir) }
+  if pane == 0 and index < array.len(struct.borrow(state, field=tabs)) { return string.copy(array.borrow(struct.borrow(state, field=tabs), index).dir) }
+  string.copy("/")
+}
+
+pub fn set_pane_active(state: ref<State>, pane: u64, value: u64) -> unit effects {} {
+  if pane == 1 { struct.set(state, value, field=other_active) }
+  else if pane == 2 { struct.set(state, value, field=active_c) }
+  else if pane == 3 { struct.set(state, value, field=active_d) }
+  else { struct.set(state, value, field=active) }
+  ()
+}
+
+pub fn pane_dir(state: ref<State>, pane: u64) -> string effects {alloc} {
+  let index: u64 = pane_active(state, pane)
+  let directory: string = match pane_path(state, pane) { some(value) => value, none => string.copy("/") }
+  directory
+}
+
+fn pane_path(state: ref<State>, pane: u64) -> option<string> effects {alloc} {
+  if pane == 1 {
+    let index: u64 = state.other_active
+    if index >= array.len(state.other_tabs) { return option.none() }
+    return option.some(string.copy(struct.borrow(array.borrow(struct.borrow(state, field=other_tabs), index), field=dir)))
+  }
+  if pane == 2 {
+    let index: u64 = state.active_c
+    if index >= array.len(struct.borrow(state, field=tabs_c)) { return option.none() }
+    return option.some(string.copy(struct.borrow(array.borrow(struct.borrow(state, field=tabs_c), index), field=dir)))
+  }
+  if pane == 3 {
+    let index: u64 = state.active_d
+    if index >= array.len(struct.borrow(state, field=tabs_d)) { return option.none() }
+    return option.some(string.copy(struct.borrow(array.borrow(struct.borrow(state, field=tabs_d), index), field=dir)))
+  }
+  option.some(string.copy(struct.borrow(array.borrow(struct.borrow(state, field=tabs), state.active), field=dir)))
+}
+
+pub fn pane_visible(state: ref<State>, pane: u64) -> array<u64> effects {alloc} {
+  if pane == 1 { return visible_in(struct.borrow(state, field=other_tabs), state.other_active) }
+  if pane == 2 { return visible_in(struct.borrow(state, field=tabs_c), state.active_c) }
+  if pane == 3 { return visible_in(struct.borrow(state, field=tabs_d), state.active_d) }
+  visible_in(struct.borrow(state, field=tabs), state.active)
+}
+
+pub fn pane_visible_entries(state: ref<State>, pane: u64) -> array<fsops.Entry> effects {alloc} {
+  var out: array<fsops.Entry> = array.new()
+  var visible_rows: array<u64> = pane_visible(state, pane)
+  let count: u64 = array.len(visible_rows)
+  var i: u64 = 0
+  loop {
+    if i >= count { break }
+    match pane_entry_at(state, pane, i) {
+      some(value) => { array.push(out, value) },
+      none => {},
+    }
+    i = i + 1
+  }
+  out
+}
+
+pub fn focused_dir(state: ref<State>) -> string effects {alloc} { pane_dir(state, state.focus) }
+
+pub fn opposite_pane(state: ref<State>, pane: u64) -> u64 effects {} {
+  if state.layout == 3 {
+    if pane == 0 { return 1 }
+    if pane == 1 { return 0 }
+    if pane == 2 { return 3 }
+    return 2
+  }
+  if pane == 0 { 1 } else { 0 }
+}
+
+pub fn opposite_dir(state: ref<State>) -> string effects {alloc} {
+  pane_dir(state, opposite_pane(state, state.focus))
+}
+
+pub fn pane_entry_at(state: ref<State>, pane: u64, position: u64) -> option<fsops.Entry> effects {alloc} {
+  if pane == 1 { return entry_in(struct.borrow(state, field=other_tabs), state.other_active, position) }
+  if pane == 2 { return entry_in(struct.borrow(state, field=tabs_c), state.active_c, position) }
+  if pane == 3 { return entry_in(struct.borrow(state, field=tabs_d), state.active_d, position) }
+  entry_in(struct.borrow(state, field=tabs), state.active, position)
+}
+
+pub fn pane_selected_entry(state: ref<State>, pane: u64) -> option<fsops.Entry> effects {alloc} {
+  var entries: array<fsops.Entry> = pane_selected_entries(state, pane)
+  if array.len(entries) != 0 { return option.some(copy_entry_value(array.borrow(entries, 0))) }
+  if pane == 1 { return selected_entry_in(struct.borrow(state, field=other_tabs), state.other_active) }
+  if pane == 2 { return selected_entry_in(struct.borrow(state, field=tabs_c), state.active_c) }
+  if pane == 3 { return selected_entry_in(struct.borrow(state, field=tabs_d), state.active_d) }
+  selected_entry_in(struct.borrow(state, field=tabs), state.active)
+}
+
+fn copy_entry_value(entry: ref<fsops.Entry>) -> fsops.Entry effects {alloc} {
+  fsops.Entry {
+    name: string.copy(entry.name), path: string.copy(entry.path), is_dir: entry.is_dir,
+    is_link: entry.is_link, size: entry.size, mtime_ns: entry.mtime_ns, kind: string.copy(entry.kind)
+  }
+}
+
+pub fn pane_selected_entries(state: ref<State>, pane: u64) -> array<fsops.Entry> effects {alloc} {
+  if pane == 1 { return selected_entries_in(struct.borrow(state, field=other_tabs), state.other_active) }
+  if pane == 2 { return selected_entries_in(struct.borrow(state, field=tabs_c), state.active_c) }
+  if pane == 3 { return selected_entries_in(struct.borrow(state, field=tabs_d), state.active_d) }
+  selected_entries_in(struct.borrow(state, field=tabs), state.active)
+}
+
+fn set_selection_in(tabs: ref<array<Tab>>, index: u64, positions: ref<array<u64>>, active: u64) -> unit effects {alloc} {
+  if index >= array.len(tabs) { return () }
+  var visible_rows: array<u64> = visible_in(tabs, index)
+  let tab: ref<Tab> = array.borrow(tabs, index)
+  let _old: array<string> = ref.swap(struct.borrow(tab, field=selection), array.new())
+  var i: u64 = 0
+  loop {
+    if i >= array.len(positions) { break }
+    let position: u64 = array.get(positions, i)
+    if position < array.len(visible_rows) {
+      let entry_index: u64 = array.get(visible_rows, position)
+      let selected_path: string = string.copy(array.borrow(struct.borrow(tab, field=entries), entry_index).path)
+      array.push(struct.borrow(tab, field=selection), selected_path)
+    }
+    i = i + 1
+  }
+  struct.set(tab, active, field=selected)
+  ()
+}
+
+pub fn set_pane_selection(state: ref<State>, pane: u64, positions: ref<array<u64>>, active: u64) -> unit effects {alloc} {
+  if pane == 1 { set_selection_in(struct.borrow(state, field=other_tabs), state.other_active, positions, active)
+    return () }
+  if pane == 2 { set_selection_in(struct.borrow(state, field=tabs_c), state.active_c, positions, active)
+    return () }
+  if pane == 3 { set_selection_in(struct.borrow(state, field=tabs_d), state.active_d, positions, active)
+    return () }
+  set_selection_in(struct.borrow(state, field=tabs), state.active, positions, active)
+  ()
+}
+
+pub fn pane_selection_count(state: ref<State>, pane: u64) -> u64 effects {alloc} {
+  var entries: array<fsops.Entry> = pane_selected_entries(state, pane)
+  array.len(entries)
+}
+
+pub fn select_all(state: ref<State>, pane: u64) -> unit effects {alloc} {
+  var positions: array<u64> = array.new()
+  var visible_rows: array<u64> = pane_visible(state, pane)
+  let count: u64 = array.len(visible_rows)
+  var i: u64 = 0
+  loop {
+    if i >= count { break }
+    array.push(positions, i)
+    i = i + 1
+  }
+  set_pane_selection(state, pane, positions, if count == 0 { 0 } else { count - 1 })
+  ()
+}
+
+pub fn invert_selection(state: ref<State>, pane: u64) -> unit effects {alloc} {
+  var chosen: array<fsops.Entry> = pane_selected_entries(state, pane)
+  var positions: array<u64> = array.new()
+  var visible_rows: array<u64> = pane_visible(state, pane)
+  let count: u64 = array.len(visible_rows)
+  var i: u64 = 0
+  loop {
+    if i >= count { break }
+    var selected: bool = false
+    match pane_entry_at(state, pane, i) {
+      some(value) => {
+        var entry: fsops.Entry = value
+        var s: u64 = 0
+        loop {
+          if s >= array.len(chosen) { break }
+          if str.eq(entry.path, array.borrow(chosen, s).path) { selected = true
+            break }
+          s = s + 1
+        }
+      },
+      none => {},
+    }
+    if not selected { array.push(positions, i) }
+    i = i + 1
+  }
+  let selected_count: u64 = array.len(positions)
+  let active: u64 = if selected_count == 0 { 0 } else { array.get(positions, selected_count - 1) }
+  set_pane_selection(state, pane, positions, active)
+  ()
+}
+
+pub fn select_pattern(state: ref<State>, pane: u64, pattern: str, prefix: bool) -> unit effects {alloc} {
+  var positions: array<u64> = array.new()
+  let needle: string = text.lower_ascii(pattern)
+  var visible_rows: array<u64> = pane_visible(state, pane)
+  let count: u64 = array.len(visible_rows)
+  var i: u64 = 0
+  loop {
+    if i >= count { break }
+    match pane_entry_at(state, pane, i) {
+      some(value) => {
+        var entry: fsops.Entry = value
+        let name: string = text.lower_ascii(entry.name)
+        let matched: bool = if prefix { str.starts_with(str.view(name), str.view(needle)) } else { text.contains(str.view(name), str.view(needle)) }
+        if str.len(str.view(needle)) != 0 and matched { array.push(positions, i) }
+      },
+      none => {},
+    }
+    i = i + 1
+  }
+  set_pane_selection(state, pane, positions, if array.len(positions) == 0 { 0 } else { array.get(positions, 0) })
+  ()
+}
+
+pub fn set_pane_selected(state: ref<State>, pane: u64, position: u64) -> unit effects {} {
+  if pane == 1 {
+    if state.other_active < array.len(struct.borrow(state, field=other_tabs)) {
+      struct.set(array.borrow(struct.borrow(state, field=other_tabs), state.other_active), position, field=selected)
+    }
+    return ()
+  }
+  if pane == 2 {
+    if state.active_c < array.len(struct.borrow(state, field=tabs_c)) {
+      struct.set(array.borrow(struct.borrow(state, field=tabs_c), state.active_c), position, field=selected)
+    }
+    return ()
+  }
+  if pane == 3 {
+    if state.active_d < array.len(struct.borrow(state, field=tabs_d)) {
+      struct.set(array.borrow(struct.borrow(state, field=tabs_d), state.active_d), position, field=selected)
+    }
+    return ()
+  }
+  if state.active < array.len(struct.borrow(state, field=tabs)) {
+    struct.set(array.borrow(struct.borrow(state, field=tabs), state.active), position, field=selected)
+  }
+  ()
+}
+
+pub fn pane_navigate(state: ref<State>, pane: u64, target: str) -> unit effects {alloc, fs.meta} {
+  if pane == 1 { navigate_in(struct.borrow(state, field=other_tabs), state.other_active, target, state.show_hidden, state.sort_mode)
+    return () }
+  if pane == 2 { navigate_in(struct.borrow(state, field=tabs_c), state.active_c, target, state.show_hidden, state.sort_mode)
+    return () }
+  if pane == 3 { navigate_in(struct.borrow(state, field=tabs_d), state.active_d, target, state.show_hidden, state.sort_mode)
+    return () }
+  navigate_in(struct.borrow(state, field=tabs), state.active, target, state.show_hidden, state.sort_mode)
+  ()
+}
+
+pub fn refresh_pane(state: ref<State>, pane: u64) -> unit effects {alloc, fs.meta} {
+  if pane == 1 { refresh_in(struct.borrow(state, field=other_tabs), state.other_active, state.show_hidden, state.sort_mode)
+    return () }
+  if pane == 2 { refresh_in(struct.borrow(state, field=tabs_c), state.active_c, state.show_hidden, state.sort_mode)
+    return () }
+  if pane == 3 { refresh_in(struct.borrow(state, field=tabs_d), state.active_d, state.show_hidden, state.sort_mode)
+    return () }
+  refresh_in(struct.borrow(state, field=tabs), state.active, state.show_hidden, state.sort_mode)
+  ()
+}
+
+pub fn focus_pane(state: ref<State>, pane: u64) -> unit effects {alloc} {
+  if pane >= pane_count(state) { return () }
+  struct.set(state, pane, field=focus)
+  ()
+}
+
+pub fn open_quad_tabs(state: ref<State>) -> unit effects {alloc, env, fs.meta} {
+  if array.len(struct.borrow(state, field=tabs_c)) == 0 {
+    var tab: Tab = Tab {dir: string.copy(str.view(home_dir())), entries: array.new(), selected: 0, selection: array.new(),
+      filter: string.new(), history: array.new(), hindex: 0}
+    array.push(tab.history, string.copy(str.view(home_dir())))
+    array.push(struct.borrow(state, field=tabs_c), tab)
+    refresh_pane(state, 2)
+  }
+  if array.len(struct.borrow(state, field=tabs_d)) == 0 {
+    var tab: Tab = Tab {dir: string.copy(str.view(home_dir())), entries: array.new(), selected: 0, selection: array.new(),
+      filter: string.new(), history: array.new(), hindex: 0}
+    array.push(tab.history, string.copy(str.view(home_dir())))
+    array.push(struct.borrow(state, field=tabs_d), tab)
+    refresh_pane(state, 3)
+  }
+  ()
+}

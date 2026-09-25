@@ -1,0 +1,100 @@
+// Reusable UI scale detection for AIR desktop applications.
+//
+// The built-in bitmap font is a fixed 5x7; on a HiDPI panel every pixel measurement must be
+// multiplied by a scale factor and a scalable font loaded. Order: an explicit environment
+// override, the X resource Xft.dpi, the RandR current width, then 1.
+module airpolo.toolkit.uiscale
+
+import std.files as files
+import std.path as path
+import std.process as proc
+import std.text as text
+
+pub fn px(factor: u64, value: u64) -> u32 effects {} {
+  cast.wrap(factor * value)
+}
+
+fn clamp_scale(value: u64) -> u64 effects {} {
+  if value < 1 { return 1 }
+  if value > 4 { return 4 }
+  value
+}
+
+fn is_digit(cursor: str) -> bool effects {} {
+  if str.len(cursor) != 1 { return false }
+  let b: u8 = cast.bits(view.get(str.bytes(cursor), 0))
+  b >= 48 and b <= 57
+}
+
+fn parse_after(body: str, marker: str) -> u64 effects {alloc} {
+  match str.find(body, marker) {
+    some(at) => {
+      var i: u64 = at + str.len(marker)
+      loop {
+        if i >= str.len(body) { break }
+        if is_digit(str.slice(body, i, i + 1)) { break }
+        i = i + 1
+      }
+      var number: string = string.new()
+      loop {
+        if i >= str.len(body) { break }
+        let cursor: str = str.slice(body, i, i + 1)
+        if is_digit(cursor) { string.append(number, cursor) } else { break }
+        i = i + 1
+      }
+      match text.parse_u64(str.view(number)) { some(value) => value, none => 0 }
+    },
+    none => 0,
+  }
+}
+
+fn read_log(log: str) -> string effects {alloc, fs.read, fs.meta} {
+  match files.read_text(log) { ok(value) => value, err(_) => string.new() }
+}
+
+// Detect the UI scale. `override_name` is the environment variable to honor first.
+pub fn detect(override_name: str, cache_dir: str) -> u64 effects {alloc, env, fs.meta, fs.read, fs.write, process} {
+  match env.get(override_name) {
+    some(value) => {
+      match text.parse_u64(value) { some(number) => { return clamp_scale(number) }, none => {} }
+    },
+    none => {},
+  }
+  let _made: result<unit, fs.error> = files.mkdirs(cache_dir)
+  var log: string = path.join(cache_dir, "scale.log")
+
+  var xrdb: array<string> = array.new()
+  array.push(xrdb, string.copy("xrdb"))
+  array.push(xrdb, string.copy("-query"))
+  match proc.run(xrdb, cache_dir, log, false) {
+    ok(status) => {
+      if proc.success(status) {
+        let dpi: u64 = parse_after(str.view(read_log(log)), "Xft.dpi:")
+        if dpi >= 120 { return clamp_scale((dpi + 48) / 96) }
+      }
+    },
+    err(_) => {},
+  }
+
+  var xrandr: array<string> = array.new()
+  array.push(xrandr, string.copy("xrandr"))
+  array.push(xrandr, string.copy("--current"))
+  match proc.run(xrandr, cache_dir, log, false) {
+    ok(status) => {
+      if proc.success(status) {
+        let body: string = read_log(log)
+        match str.find(str.view(body), "current ") {
+          some(at) => {
+            let rest: string = string.copy(str.slice(str.view(body), at + 8, str.len(str.view(body))))
+            let width: u64 = parse_after(str.view(rest), "")
+            if width >= 2400 { return clamp_scale((width + 960) / 1920) }
+          },
+          none => {},
+        }
+      }
+    },
+    err(_) => {},
+  }
+  let _removed: result<unit, fs.error> = files.remove(log)
+  1
+}

@@ -1,0 +1,52 @@
+// Reusable directory change detection for a file manager. This is a polling watcher: it
+// records the directory's entry names and reports when the listing differs, which keeps a
+// pane coherent when files are added, removed or renamed from outside the application.
+// Comparing names (rather than a timestamp) works on every filesystem and needs no kernel
+// event source; a native event source can replace the comparison without changing this API.
+module airpolo.toolkit.watch
+
+import std.files as files
+import std.text as text
+
+pub type Watcher = struct { directory: string, snapshot: string }
+
+fn snapshot_of(target: str) -> string effects {alloc, fs.meta} {
+  match files.list_dir(target) {
+    ok(found) => {
+      var names: array<string> = found
+      var out: string = string.new()
+      var i: u64 = 0
+      loop {
+        if i >= array.len(names) { break }
+        string.append(out, str.view(array.borrow(names, i)))
+        string.append(out, "\n")
+        i = i + 1
+      }
+      out
+    },
+    err(_) => string.new(),
+  }
+}
+
+pub fn track(target: str) -> Watcher effects {alloc, fs.meta} {
+  Watcher {directory: string.copy(target), snapshot: snapshot_of(target)}
+}
+
+// True when the directory listing differs from the recorded snapshot.
+pub fn changed(watcher: ref<Watcher>) -> bool effects {alloc, fs.meta} {
+  not str.eq(str.view(snapshot_of(str.view(watcher.directory))), str.view(watcher.snapshot))
+}
+
+pub fn mark(watcher: ref<Watcher>) -> unit effects {alloc, fs.meta} {
+  let current: string = snapshot_of(str.view(watcher.directory))
+  let _old: string = ref.swap(struct.borrow(watcher, field=snapshot), current)
+  ()
+}
+
+// Retarget the watcher when the caller has navigated elsewhere.
+pub fn retarget(watcher: ref<Watcher>, target: str) -> unit effects {alloc, fs.meta} {
+  if str.eq(str.view(watcher.directory), target) { return () }
+  let _old: string = ref.swap(struct.borrow(watcher, field=directory), string.copy(target))
+  mark(watcher)
+  ()
+}

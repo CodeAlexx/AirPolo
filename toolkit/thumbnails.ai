@@ -1,0 +1,66 @@
+// Reusable thumbnail extraction: PNG via std.image, JPEG via std.jpeg, and a first video
+// frame via std.media (FFmpeg). Returns a draw.Surface ready for widgets.image.
+module airpolo.toolkit.thumbnails
+
+import std.files as files
+import std.image as image
+import std.jpeg as jpeg
+import std.media as media
+import std.path as path
+import std.text as text
+import std.draw as draw
+import "images.ai" as images
+
+fn ext_of(name: str) -> string effects {alloc} {
+  let raw: string = path.extension(name)
+  if str.starts_with(str.view(raw), ".") {
+    return text.lower_ascii(str.slice(str.view(raw), 1, str.len(str.view(raw))))
+  }
+  text.lower_ascii(str.view(raw))
+}
+
+pub fn supports(name: str) -> bool effects {alloc} {
+  let ext: string = ext_of(name)
+  if str.eq(str.view(ext), "png") { return true }
+  if str.eq(str.view(ext), "jpg") or str.eq(str.view(ext), "jpeg") { return true }
+  if str.eq(str.view(ext), "mp4") or str.eq(str.view(ext), "mkv") or str.eq(str.view(ext), "webm")
+     or str.eq(str.view(ext), "mov") { return true }
+  false
+}
+
+pub fn for_path(target: str, work: str, edge: u32) -> option<draw.Surface> effects {alloc, fs.read, fs.write, fs.meta, process} {
+  let ext: string = ext_of(str.view(path.basename(target)))
+  if str.eq(str.view(ext), "png") {
+    match files.read_bytes(target) {
+      ok(data) => match image.decode_png(bytes.view(data)) {
+        ok(surface) => {
+          var decoded: draw.Surface = surface
+          return images.fit_surface(decoded, edge)
+        },
+        err(_) => {},
+      },
+      err(_) => {},
+    }
+  } else if str.eq(str.view(ext), "jpg") or str.eq(str.view(ext), "jpeg") {
+    match jpeg.load(target) {
+      ok(loaded) => {
+        var decoded: jpeg.Image = loaded
+        match jpeg.to_surface(decoded) {
+          ok(surface) => {
+            var decoded_surface: draw.Surface = surface
+            return images.fit_surface(decoded_surface, edge)
+          },
+          err(_) => {},
+        }
+      },
+      err(_) => {},
+    }
+  } else if str.eq(str.view(ext), "mp4") or str.eq(str.view(ext), "mkv") or str.eq(str.view(ext), "webm")
+     or str.eq(str.view(ext), "mov") {
+    match media.frame(target, work, 0, edge) {
+      ok(surface) => { return option.some(surface) },
+      err(_) => {},
+    }
+  }
+  option.none()
+}

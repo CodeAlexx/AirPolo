@@ -1,0 +1,99 @@
+// The background operation, and the part of it that has nothing to do with a window.
+//
+// A desktop application that computes on its event-loop thread stops answering the window
+// manager, so a slow operation belongs on a task. What makes that awkward is usually not the
+// task but the bookkeeping around it: how much is done, whether the user asked to stop, and
+// what the window should say right now. All of that lives here, in a model with no `ui` effect,
+// so it is tested headlessly and src/main.ai only spawns, polls and paints.
+//
+// The work itself is deliberately dull — a checksum over a range of numbers — so the pattern is
+// visible without a domain to learn. Replace `chunk` with the slow thing your application does.
+module airpolo.work
+import std.tasks as tasks
+import std.text as text
+
+// How the operation reports itself. `total` is fixed when the job starts, so progress is a real
+// fraction rather than a spinner that means nothing.
+pub type Progress = struct { done: u64, total: u64, checksum: u64, cancelled: bool }
+
+pub fn chunk_size() -> u64 effects {} { 200000 }
+
+pub fn start(total: u64) -> Progress effects {} {
+  Progress {done: 0, total: total, checksum: 0, cancelled: false}
+}
+
+pub fn finished(state: ref<Progress>) -> bool effects {} {
+  state.cancelled or state.done >= state.total
+}
+
+pub fn percent(state: ref<Progress>) -> u64 effects {} {
+  if state.total == 0 { return 100 }
+  let done: u64 = if state.done > state.total { state.total } else { state.done }
+  done * 100 / state.total
+}
+
+// What the window shows. One function, so the label cannot say "working" while the model thinks
+// the job is finished.
+pub fn describe(state: ref<Progress>) -> string effects {alloc} {
+  if state.cancelled {
+    var stopped: string = text.concat("stopped at ", str.view(string.from_int(percent(state))))
+    string.append(stopped, "%")
+    return stopped
+  }
+  if state.done >= state.total {
+    return text.concat("done, checksum ", str.view(string.from_int(state.checksum)))
+  }
+  var line: string = text.concat("working ", str.view(string.from_int(percent(state))))
+  string.append(line, "%")
+  line
+}
+
+// One chunk of the work: small enough that a cancel request is noticed promptly, large enough
+// that the loop is not all overhead. This is the only function to replace for real work.
+pub fn chunk(from: u64, count: u64) -> u64 effects {} {
+  var sum: u64 = 0
+  var i: u64 = 0
+  loop {
+    if i >= count { break }
+    let value: u64 = from + i
+    sum = sum + value * 2654435761 % 4294967291
+    i = i + 1
+  }
+  sum
+}
+
+// Advance the job by one chunk. Returns the new state; the caller decides when to stop, which
+// is what lets the same model be driven by a test loop and by a window's event loop.
+pub fn advance(state: ref<Progress>) -> unit effects {} {
+  if finished(state) { return () }
+  let remaining: u64 = state.total - state.done
+  let size: u64 = if remaining < chunk_size() { remaining } else { chunk_size() }
+  let partial: u64 = chunk(state.done, size)
+  struct.set(state, state.checksum + partial, field=checksum)
+  struct.set(state, state.done + size, field=done)
+}
+
+pub fn cancel(state: ref<Progress>) -> unit effects {} {
+  if state.done >= state.total { return () }
+  struct.set(state, true, field=cancelled)
+}
+
+// The whole job, on a task. It checks the cancellation token between chunks, so a stop request
+// is honoured within one chunk rather than at the end -- and the partial result is returned
+// rather than discarded, because a cancelled job that reports nothing is indistinguishable
+// from a job that failed.
+// A spawned function takes owned values only -- no views, refs or handles cross a task
+// boundary -- so the signal path is passed as an owned string rather than borrowed.
+pub fn run(total: u64, signal: string own) -> Progress effects {alloc, fs.meta, fs.read} {
+  var path_of: string = signal
+  var state: Progress = start(total)
+  loop {
+    if finished(state) { break }
+    if str.len(str.view(path_of)) != 0 and tasks.requested_at(str.view(path_of)) {
+      cancel(state)
+      break
+    }
+    advance(state)
+  }
+  state
+}
