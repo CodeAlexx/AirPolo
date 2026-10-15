@@ -5,10 +5,7 @@
     "name": "airpolo",
     "version": "0.1.0",
     "description": "AirPolo: a native AIR file manager (Polo port) with a reusable toolkit layer.",
-    "license": "MIT",
-    "notices": [
-      "LICENSE"
-    ]
+    "notices": []
   },
   "targets": {
     "lib": "toolkit/fsops.ai",
